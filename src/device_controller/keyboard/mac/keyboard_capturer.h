@@ -21,11 +21,13 @@ class KeyboardCapturer : public DeviceController {
  public:
   virtual int Hook(OnKeyAction on_key_action, void* user_ptr);
   virtual int Unhook();
-  virtual int SendKeyboardCommand(int key_code, bool is_down);
+  virtual int SendKeyboardCommand(int key_code, bool is_down,
+                                  uint32_t scan_code = 0,
+                                  bool extended = false);
 
  private:
-  CFMachPortRef event_tap_;
-  CFRunLoopSourceRef run_loop_source_;
+  CFMachPortRef event_tap_ = nullptr;
+  CFRunLoopSourceRef run_loop_source_ = nullptr;
 
  public:
   bool caps_lock_flag_ = false;

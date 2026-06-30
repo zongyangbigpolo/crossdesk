@@ -15,10 +15,10 @@ bool Render::ConnectionStatusWindow(
   ImGui::SetNextWindowSize(
       ImVec2(io.DisplaySize.x * 0.33f, io.DisplaySize.y * 0.33f));
 
-  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, window_rounding_ * 0.5f);
   ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
   ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, window_rounding_);
 
   ImGui::Begin("ConnectionStatusWindow", nullptr,
                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -36,6 +36,18 @@ bool Render::ConnectionStatusWindow(
     text = localization::p2p_connecting[localization_language_index_];
     ImGui::SetCursorPosX(connection_status_window_width * 0.43f);
     ImGui::SetCursorPosY(connection_status_window_height * 0.67f);
+    // cancel
+    if (ImGui::Button(
+            localization::cancel[localization_language_index_].c_str()) ||
+        ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+      show_connection_status_window_ = false;
+      re_enter_remote_id_ = true;
+      LOG_INFO("User cancelled connecting to [{}]", props->remote_id_);
+      if (props->peer_) {
+        LeaveConnection(props->peer_, props->remote_id_.c_str());
+      }
+      ret_flag = true;
+    }
   } else if (ConnectionStatus::Connected == props->connection_status_) {
     text = localization::p2p_connected[localization_language_index_];
     ImGui::SetCursorPosX(connection_status_window_width * 0.43f);

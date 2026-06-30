@@ -17,7 +17,7 @@ int Render::RecentConnectionsWindow() {
   ImGui::BeginChild(
       "RecentConnectionsWindow",
       ImVec2(recent_connection_window_width, recent_connection_window_height),
-      ImGuiChildFlags_Border,
+      ImGuiChildFlags_Borders,
       ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
           ImGuiWindowFlags_NoBringToFrontOnFocus);
   ImGui::PopStyleVar();
@@ -64,7 +64,7 @@ int Render::ShowRecentConnections() {
   ImGui::BeginChild(
       "RecentConnectionsContainer",
       ImVec2(recent_connection_panel_width, recent_connection_panel_height),
-      ImGuiChildFlags_Border,
+      ImGuiChildFlags_Borders,
       ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
           ImGuiWindowFlags_NoBringToFrontOnFocus |
           ImGuiWindowFlags_AlwaysHorizontalScrollbar |
@@ -122,6 +122,8 @@ int Render::ShowRecentConnections() {
       it.second.remote_host_name = "unknown";
     }
 
+    bool online = device_presence_->IsOnline(it.second.remote_id);
+
     ImVec2 image_screen_pos = ImVec2(
         ImGui::GetCursorScreenPos().x + recent_connection_image_width * 0.04f,
         ImGui::GetCursorScreenPos().y + recent_connection_image_height * 0.08f);
@@ -132,6 +134,29 @@ int Render::ShowRecentConnections() {
     ImGui::Image(
         (ImTextureID)(intptr_t)it.second.texture,
         ImVec2(recent_connection_image_width, recent_connection_image_height));
+    if (ImGui::IsItemHovered()) {
+      ImGui::BeginTooltip();
+      ImGui::SetWindowFontScale(0.5f);
+      std::string display_host_name_with_presence =
+          it.second.remote_host_name + " " +
+          (online ? localization::online[localization_language_index_]
+                  : localization::offline[localization_language_index_]);
+      ImGui::Text("%s", display_host_name_with_presence.c_str());
+      ImGui::SetWindowFontScale(1.0f);
+      ImGui::EndTooltip();
+    }
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    ImVec2 circle_pos =
+        ImVec2(image_screen_pos.x + recent_connection_image_width * 0.07f,
+               image_screen_pos.y + recent_connection_image_height * 0.12f);
+    ImU32 fill_color =
+        online ? IM_COL32(0, 255, 0, 255) : IM_COL32(140, 140, 140, 255);
+    ImU32 border_color = IM_COL32(255, 255, 255, 255);
+    float dot_radius = recent_connection_image_height * 0.06f;
+    draw_list->AddCircleFilled(circle_pos, dot_radius * 1.25f, border_color,
+                               100);
+    draw_list->AddCircleFilled(circle_pos, dot_radius, fill_color, 100);
 
     // remote id display button
     {
@@ -155,14 +180,6 @@ int Render::ShowRecentConnections() {
       ImGui::Text("%s", it.second.remote_id.c_str());
       ImGui::SetWindowFontScale(1.0f);
       ImGui::PopStyleColor(3);
-
-      if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::SetWindowFontScale(0.5f);
-        ImGui::Text("%s", it.second.remote_host_name.c_str());
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::EndTooltip();
-      }
     }
 
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0.2f));
@@ -242,6 +259,9 @@ int Render::ShowRecentConnections() {
   if (show_confirm_delete_connection_) {
     ConfirmDeleteConnection();
   }
+  if (show_offline_warning_window_) {
+    OfflineWarningWindow();
+  }
 
   return 0;
 }
@@ -253,10 +273,10 @@ int Render::ConfirmDeleteConnection() {
   ImGui::SetNextWindowSize(
       ImVec2(io.DisplaySize.x * 0.33f, io.DisplaySize.y * 0.33f));
 
-  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
-  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0, 1.0, 1.0, 1.0));
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, window_rounding_ * 0.5f);
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
   ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, window_rounding_);
 
   ImGui::Begin("ConfirmDeleteConnectionWindow", nullptr,
                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -293,6 +313,47 @@ int Render::ConfirmDeleteConnection() {
   ImGui::SetCursorPosX((connection_status_window_width - text_width) * 0.5f);
   ImGui::SetCursorPosY(connection_status_window_height * 0.2f);
   ImGui::Text("%s", text.c_str());
+  ImGui::SetWindowFontScale(1.0f);
+
+  ImGui::End();
+  ImGui::PopStyleVar();
+  return 0;
+}
+
+int Render::OfflineWarningWindow() {
+  ImGuiIO& io = ImGui::GetIO();
+  ImGui::SetNextWindowPos(
+      ImVec2(io.DisplaySize.x * 0.33f, io.DisplaySize.y * 0.33f));
+  ImGui::SetNextWindowSize(
+      ImVec2(io.DisplaySize.x * 0.33f, io.DisplaySize.y * 0.33f));
+
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, window_rounding_ * 0.5f);
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, window_rounding_);
+
+  ImGui::Begin("OfflineWarningWindow", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                   ImGuiWindowFlags_NoSavedSettings);
+  ImGui::PopStyleVar(2);
+  ImGui::PopStyleColor();
+
+  auto window_width = ImGui::GetWindowSize().x;
+  auto window_height = ImGui::GetWindowSize().y;
+
+  ImGui::SetCursorPosX(window_width * 0.43f);
+  ImGui::SetCursorPosY(window_height * 0.67f);
+  ImGui::SetWindowFontScale(0.5f);
+  if (ImGui::Button(localization::ok[localization_language_index_].c_str()) ||
+      ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+      ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+    show_offline_warning_window_ = false;
+  }
+
+  auto text_width = ImGui::CalcTextSize(offline_warning_text_.c_str()).x;
+  ImGui::SetCursorPosX((window_width - text_width) * 0.5f);
+  ImGui::SetCursorPosY(window_height * 0.2f);
+  ImGui::Text("%s", offline_warning_text_.c_str());
   ImGui::SetWindowFontScale(1.0f);
 
   ImGui::End();

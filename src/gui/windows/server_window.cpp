@@ -49,7 +49,7 @@ int Render::ServerWindow() {
   ImGui::SetNextWindowSize(ImVec2(server_window_width_, server_window_height_),
                            ImGuiCond_Always);
   ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, window_rounding_);
   ImGui::Begin("##server_window", nullptr,
                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -61,12 +61,12 @@ int Render::ServerWindow() {
 
   ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 0.0f));
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, window_rounding_);
   ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
   ImGui::BeginChild(
       "ServerTitleBar",
       ImVec2(server_window_width_, server_window_title_bar_height_),
-      ImGuiChildFlags_Border,
+      ImGuiChildFlags_Borders,
       ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
           ImGuiWindowFlags_NoBringToFrontOnFocus);
 
@@ -140,7 +140,7 @@ int Render::RemoteClientInfoWindow() {
   ImGui::BeginChild(
       "RemoteClientInfoWindow",
       ImVec2(remote_client_info_window_width, remote_client_info_window_height),
-      ImGuiChildFlags_Border,
+      ImGuiChildFlags_Borders,
       ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
           ImGuiWindowFlags_NoBringToFrontOnFocus);
   ImGui::PopStyleVar();
@@ -148,33 +148,38 @@ int Render::RemoteClientInfoWindow() {
 
   float font_scale = localization_language_index_ == 0 ? 0.5f : 0.45f;
 
-  std::vector<std::string> remote_hostnames;
-  remote_hostnames.reserve(connection_host_names_.size());
-  for (const auto& kv : connection_host_names_) {
-    remote_hostnames.push_back(kv.second);
+  std::vector<std::pair<std::string, std::string>> remote_entries;
+  remote_entries.reserve(connection_status_.size());
+  for (const auto& kv : connection_status_) {
+    const auto host_it = connection_host_names_.find(kv.first);
+    const std::string display_name =
+        (host_it != connection_host_names_.end() && !host_it->second.empty())
+            ? host_it->second
+            : kv.first;
+    remote_entries.emplace_back(kv.first, display_name);
   }
 
-  auto find_remote_id_by_hostname =
-      [this](const std::string& hostname) -> std::string {
-    for (const auto& kv : connection_host_names_) {
-      if (kv.second == hostname) {
-        return kv.first;
+  auto find_display_name_by_remote_id =
+      [&remote_entries](const std::string& remote_id) -> std::string {
+    for (const auto& entry : remote_entries) {
+      if (entry.first == remote_id) {
+        return entry.second;
       }
     }
     return {};
   };
 
-  if (!selected_server_remote_hostname_.empty()) {
-    if (std::find(remote_hostnames.begin(), remote_hostnames.end(),
-                  selected_server_remote_hostname_) == remote_hostnames.end()) {
-      selected_server_remote_hostname_.clear();
-      selected_server_remote_id_.clear();
-    }
+  if (!selected_server_remote_id_.empty() &&
+      find_display_name_by_remote_id(selected_server_remote_id_).empty()) {
+    selected_server_remote_id_.clear();
+    selected_server_remote_hostname_.clear();
   }
-  if (selected_server_remote_hostname_.empty() && !remote_hostnames.empty()) {
-    selected_server_remote_hostname_ = remote_hostnames.front();
-    selected_server_remote_id_ =
-        find_remote_id_by_hostname(selected_server_remote_hostname_);
+  if (selected_server_remote_id_.empty() && !remote_entries.empty()) {
+    selected_server_remote_id_ = remote_entries.front().first;
+  }
+  if (!selected_server_remote_id_.empty()) {
+    selected_server_remote_hostname_ =
+        find_display_name_by_remote_id(selected_server_remote_id_);
   }
 
   ImGui::SetWindowFontScale(font_scale);
@@ -196,13 +201,12 @@ int Render::RemoteClientInfoWindow() {
   ImGui::AlignTextToFramePadding();
   if (ImGui::BeginCombo("##server_remote_id", selected_preview)) {
     ImGui::SetWindowFontScale(localization_language_index_ == 0 ? 0.45f : 0.4f);
-    for (int i = 0; i < static_cast<int>(remote_hostnames.size()); i++) {
+    for (int i = 0; i < static_cast<int>(remote_entries.size()); i++) {
       const bool selected =
-          (remote_hostnames[i] == selected_server_remote_hostname_);
-      if (ImGui::Selectable(remote_hostnames[i].c_str(), selected)) {
-        selected_server_remote_hostname_ = remote_hostnames[i];
-        selected_server_remote_id_ =
-            find_remote_id_by_hostname(selected_server_remote_hostname_);
+          (remote_entries[i].first == selected_server_remote_id_);
+      if (ImGui::Selectable(remote_entries[i].second.c_str(), selected)) {
+        selected_server_remote_id_ = remote_entries[i].first;
+        selected_server_remote_hostname_ = remote_entries[i].second;
       }
       if (selected) {
         ImGui::SetItemDefaultFocus();
@@ -358,7 +362,7 @@ int Render::RemoteClientInfoWindow() {
   ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
   ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
   ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.5f, 0.5f, 1.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, window_rounding_);
   ImGui::SetWindowFontScale(font_scale);
   if (ImGui::Button(ICON_FA_XMARK, ImVec2(close_connection_button_width,
                                           close_connection_button_height))) {

@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <cstdlib>
 #include <string>
 
 #include "layout.h"
@@ -77,8 +76,8 @@ int Render::UpdateNotificationWindow() {
 
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, window_rounding_);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, window_rounding_ * 0.5f);
     ImGui::Begin(
         localization::notification[localization_language_index_].c_str(),
         nullptr,
@@ -93,7 +92,7 @@ int Render::UpdateNotificationWindow() {
     ImGui::SetWindowFontScale(0.55f);
     std::string title =
         localization::new_version_available[localization_language_index_] +
-        ": v" + latest_version_;
+        ": " + latest_version_;
     ImGui::Text("%s", title.c_str());
     ImGui::SetWindowFontScale(0.1f);
 
@@ -104,6 +103,7 @@ int Render::UpdateNotificationWindow() {
         localization::access_website[localization_language_index_] +
         "https://crossdesk.cn";
     ImGui::SetWindowFontScale(0.5f);
+    ImGui::SetCursorPosX(update_notification_window_width * 0.1f);
     Hyperlink(download_text, "https://crossdesk.cn",
               update_notification_window_width);
     ImGui::SetWindowFontScale(1.0f);
@@ -121,7 +121,7 @@ int Render::UpdateNotificationWindow() {
     ImGui::BeginChild(
         "ScrollableContent",
         ImVec2(update_notification_window_width * 0.9f, scrollable_height),
-        ImGuiChildFlags_Border, ImGuiWindowFlags_None);
+        ImGuiChildFlags_Borders, ImGuiWindowFlags_None);
     ImGui::SetWindowFontScale(0.5f);
     // set text wrap position to current available width (accounts for
     // scrollbar)
@@ -184,14 +184,7 @@ int Render::UpdateNotificationWindow() {
             localization::update[localization_language_index_].c_str())) {
       // open download page
       std::string url = "https://crossdesk.cn";
-#if defined(_WIN32)
-      std::string cmd = "start " + url;
-#elif defined(__APPLE__)
-      std::string cmd = "open " + url;
-#else
-      std::string cmd = "xdg-open " + url;
-#endif
-      system(cmd.c_str());
+      OpenUrl(url);
       show_update_notification_window_ = false;
     }
 

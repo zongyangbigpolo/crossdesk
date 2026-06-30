@@ -18,7 +18,7 @@ int Render::RemoteWindow() {
   ImGui::SetNextWindowPos(
       ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * TITLE_BAR_HEIGHT),
       ImGuiCond_Always);
-  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, window_rounding_ * 0.5f);
 
   ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
   ImGui::BeginChild("RemoteDesktopWindow",
@@ -48,7 +48,7 @@ int Render::RemoteWindow() {
     ImGui::BeginChild(
         "RemoteDesktopWindow_1",
         ImVec2(remote_window_width * 0.8f, remote_window_height * 0.43f),
-        ImGuiChildFlags_Border,
+        ImGuiChildFlags_Borders,
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImGui::PopStyleVar();
@@ -165,7 +165,21 @@ static int InputTextCallback(ImGuiInputTextCallbackData* data) {
 }
 
 int Render::ConnectTo(const std::string& remote_id, const char* password,
-                      bool remember_password) {
+                      bool remember_password, bool bypass_presence_check) {
+  if (!bypass_presence_check && !device_presence_->IsOnline(remote_id)) {
+    int ret =
+        RequestSingleDevicePresence(remote_id, password, remember_password);
+    if (ret != 0) {
+      offline_warning_text_ =
+          localization::device_offline[localization_language_index_];
+      show_offline_warning_window_ = true;
+      LOG_WARN("Presence probe failed for [{}], ret={}", remote_id, ret);
+    } else {
+      LOG_INFO("Presence probe requested for [{}] before connect", remote_id);
+    }
+    return -1;
+  }
+
   LOG_INFO("Connect to [{}]", remote_id);
   focused_remote_id_ = remote_id;
 
@@ -197,6 +211,9 @@ int Render::ConnectTo(const std::string& remote_id, const char* password,
         props->control_window_max_width_ = title_bar_height_ * 9.0f;
         props->control_window_max_height_ = title_bar_height_ * 7.0f;
 
+        props->connection_status_ = ConnectionStatus::Connecting;
+        show_connection_status_window_ = true;
+
         if (!props->peer_) {
           LOG_INFO("Create peer [{}] instance failed", props->local_id_);
           return -1;
@@ -207,6 +224,8 @@ int Render::ConnectTo(const std::string& remote_id, const char* password,
         }
         AddAudioStream(props->peer_, props->audio_label_.c_str());
         AddDataStream(props->peer_, props->data_label_.c_str(), false);
+        AddDataStream(props->peer_, props->mouse_label_.c_str(), false);
+        AddDataStream(props->peer_, props->keyboard_label_.c_str(), true);
         AddDataStream(props->peer_, props->control_data_label_.c_str(), true);
         AddDataStream(props->peer_, props->file_label_.c_str(), true);
         AddDataStream(props->peer_, props->file_feedback_label_.c_str(), true);

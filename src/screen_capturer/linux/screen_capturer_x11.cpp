@@ -5,7 +5,9 @@
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/Xrandr.h>
 
+#include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 #include "libyuv.h"
@@ -13,11 +15,58 @@
 
 namespace crossdesk {
 
+namespace {
+
+std::atomic<int> g_x11_last_error_code{0};
+std::mutex g_x11_error_handler_mutex;
+
+int CaptureX11ErrorHandler([[maybe_unused]] Display* display,
+                           XErrorEvent* error_event) {
+  if (error_event) {
+    g_x11_last_error_code.store(error_event->error_code);
+  } else {
+    g_x11_last_error_code.store(-1);
+  }
+  return 0;
+}
+
+class ScopedX11ErrorTrap {
+ public:
+  explicit ScopedX11ErrorTrap(Display* display)
+      : display_(display), lock_(g_x11_error_handler_mutex) {
+    g_x11_last_error_code.store(0);
+    previous_handler_ = XSetErrorHandler(CaptureX11ErrorHandler);
+  }
+
+  ~ScopedX11ErrorTrap() {
+    if (display_) {
+      XSync(display_, False);
+    }
+    XSetErrorHandler(previous_handler_);
+  }
+
+  int SyncAndGetError() const {
+    if (display_) {
+      XSync(display_, False);
+    }
+    return g_x11_last_error_code.load();
+  }
+
+ private:
+  Display* display_ = nullptr;
+  int (*previous_handler_)(Display*, XErrorEvent*) = nullptr;
+  std::unique_lock<std::mutex> lock_;
+};
+
+}  // namespace
+
 ScreenCapturerX11::ScreenCapturerX11() {}
 
 ScreenCapturerX11::~ScreenCapturerX11() { Destroy(); }
 
 int ScreenCapturerX11::Init(const int fps, cb_desktop_data cb) {
+  Destroy();
+
   display_ = XOpenDisplay(nullptr);
   if (!display_) {
     LOG_ERROR("Cannot connect to X server");
@@ -29,6 +78,7 @@ int ScreenCapturerX11::Init(const int fps, cb_desktop_data cb) {
   if (!screen_res_) {
     LOG_ERROR("Failed to get screen resources");
     XCloseDisplay(display_);
+    display_ = nullptr;
     return 1;
   }
 
@@ -71,8 +121,15 @@ int ScreenCapturerX11::Init(const int fps, cb_desktop_data cb) {
   width_ = attr.width;
   height_ = attr.height;
 
-  if (width_ % 2 != 0 || height_ % 2 != 0) {
-    LOG_ERROR("Width and height must be even numbers");
+  if ((width_ & 1) != 0 || (height_ & 1) != 0) {
+    LOG_WARN("X11 root size {}x{} is not even, aligning down to {}x{} for NV12",
+             width_, height_, width_ & ~1, height_ & ~1);
+    width_ &= ~1;
+    height_ &= ~1;
+  }
+
+  if (width_ <= 1 || height_ <= 1) {
+    LOG_ERROR("Invalid capture size after alignment: {}x{}", width_, height_);
     return -2;
   }
 
@@ -81,6 +138,11 @@ int ScreenCapturerX11::Init(const int fps, cb_desktop_data cb) {
 
   y_plane_.resize(width_ * height_);
   uv_plane_.resize((width_ / 2) * (height_ / 2) * 2);
+
+  if (!ProbeCapture()) {
+    LOG_ERROR("X11 backend probe failed, XGetImage is not usable");
+    return -3;
+  }
 
   return 0;
 }
@@ -108,9 +170,24 @@ int ScreenCapturerX11::Start(bool show_cursor) {
   show_cursor_ = show_cursor;
   running_ = true;
   paused_ = false;
+  capture_error_count_ = 0;
   thread_ = std::thread([this]() {
+    using clock = std::chrono::steady_clock;
+    const auto frame_interval =
+        std::chrono::milliseconds(std::max(1, 1000 / std::max(1, fps_)));
+
     while (running_) {
-      if (!paused_) OnFrame();
+      const auto frame_start = clock::now();
+      if (!paused_) {
+        OnFrame();
+      }
+
+      const auto elapsed =
+          std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() -
+                                                                frame_start);
+      if (elapsed < frame_interval) {
+        std::this_thread::sleep_for(frame_interval - elapsed);
+      }
     }
   });
   return 0;
@@ -138,6 +215,10 @@ int ScreenCapturerX11::SwitchTo(int monitor_index) {
   return 0;
 }
 
+int ScreenCapturerX11::ResetToInitialMonitor() {
+  monitor_index_ = initial_monitor_index_;
+  return 0;
+}
 std::vector<DisplayInfo> ScreenCapturerX11::GetDisplayInfoList() {
   return display_info_list_;
 }
@@ -148,19 +229,44 @@ void ScreenCapturerX11::OnFrame() {
     return;
   }
 
-  if (monitor_index_ < 0 || monitor_index_ >= display_info_list_.size()) {
-    LOG_ERROR("Invalid monitor index: {}", monitor_index_.load());
+  const int monitor_index = monitor_index_.load();
+  if (monitor_index < 0 ||
+      monitor_index >= static_cast<int>(display_info_list_.size())) {
+    LOG_ERROR("Invalid monitor index: {}", monitor_index);
     return;
   }
 
-  left_ = display_info_list_[monitor_index_].left;
-  top_ = display_info_list_[monitor_index_].top;
-  width_ = display_info_list_[monitor_index_].width;
-  height_ = display_info_list_[monitor_index_].height;
+  left_ = display_info_list_[monitor_index].left;
+  top_ = display_info_list_[monitor_index].top;
+  width_ = display_info_list_[monitor_index].width & ~1;
+  height_ = display_info_list_[monitor_index].height & ~1;
 
-  XImage* image = XGetImage(display_, root_, left_, top_, width_, height_,
-                            AllPlanes, ZPixmap);
-  if (!image) return;
+  if (width_ <= 1 || height_ <= 1) {
+    LOG_ERROR("Invalid capture size: {}x{}", width_, height_);
+    return;
+  }
+
+  XImage* image = nullptr;
+  int x11_error = 0;
+  {
+    ScopedX11ErrorTrap trap(display_);
+    image = XGetImage(display_, root_, left_, top_, width_, height_, AllPlanes,
+                      ZPixmap);
+    x11_error = trap.SyncAndGetError();
+  }
+
+  if (x11_error != 0 || !image) {
+    if (image) {
+      XDestroyImage(image);
+    }
+    ++capture_error_count_;
+    if (capture_error_count_ == 1 || capture_error_count_ % 120 == 0) {
+      LOG_WARN("X11 capture failed: x11_error={}, image={}, consecutive={}",
+               x11_error, image ? "valid" : "null", capture_error_count_);
+    }
+    return;
+  }
+  capture_error_count_ = 0;
 
   // if enable show cursor, draw cursor
   if (show_cursor_) {
@@ -176,23 +282,41 @@ void ScreenCapturerX11::OnFrame() {
     }
   }
 
-  bool needs_copy = image->bytes_per_line != width_ * 4;
-  std::vector<uint8_t> argb_buf;
-  uint8_t* src_argb = nullptr;
-
-  if (needs_copy) {
-    argb_buf.resize(width_ * height_ * 4);
-    for (int y = 0; y < height_; ++y) {
-      memcpy(&argb_buf[y * width_ * 4], image->data + y * image->bytes_per_line,
-             width_ * 4);
-    }
-    src_argb = argb_buf.data();
-  } else {
-    src_argb = reinterpret_cast<uint8_t*>(image->data);
+  if (image->bits_per_pixel != 32 || image->bytes_per_line <= 0) {
+    LOG_WARN(
+        "Unsupported X11 image layout: bits_per_pixel={}, bytes_per_line={}",
+        image->bits_per_pixel, image->bytes_per_line);
+    XDestroyImage(image);
+    return;
   }
 
-  libyuv::ARGBToNV12(src_argb, width_ * 4, y_plane_.data(), width_,
-                     uv_plane_.data(), width_, width_, height_);
+  const uint8_t* src_argb = reinterpret_cast<const uint8_t*>(image->data);
+  const int src_stride_argb = image->bytes_per_line;
+
+  const size_t y_size =
+      static_cast<size_t>(width_) * static_cast<size_t>(height_);
+  const size_t uv_size = y_size / 2;
+  if (y_plane_.size() != y_size) {
+    y_plane_.resize(y_size);
+  }
+  if (uv_plane_.size() != uv_size) {
+    uv_plane_.resize(uv_size);
+  }
+
+  const int convert_ret =
+      use_abgr_to_nv12_
+          ? libyuv::ABGRToNV12(src_argb, src_stride_argb, y_plane_.data(),
+                               width_, uv_plane_.data(), width_, width_,
+                               height_)
+          : libyuv::ARGBToNV12(src_argb, src_stride_argb, y_plane_.data(),
+                               width_, uv_plane_.data(), width_, width_,
+                               height_);
+  if (convert_ret != 0) {
+    LOG_WARN("X11 {} failed: {}",
+             use_abgr_to_nv12_ ? "ABGRToNV12" : "ARGBToNV12", convert_ret);
+    XDestroyImage(image);
+    return;
+  }
 
   std::vector<uint8_t> nv12;
   nv12.reserve(y_plane_.size() + uv_plane_.size());
@@ -201,7 +325,7 @@ void ScreenCapturerX11::OnFrame() {
 
   if (callback_) {
     callback_(nv12.data(), width_ * height_ * 3 / 2, width_, height_,
-              display_info_list_[monitor_index_].name.c_str());
+              display_info_list_[monitor_index].name.c_str());
   }
 
   XDestroyImage(image);
@@ -283,5 +407,35 @@ void ScreenCapturerX11::DrawCursor(XImage* image, int x, int y) {
   }
 
   XFree(cursor_image);
+}
+
+bool ScreenCapturerX11::ProbeCapture() {
+  if (!display_ || display_info_list_.empty()) {
+    return false;
+  }
+
+  const auto& first_display = display_info_list_[0];
+  XImage* probe_image = nullptr;
+  int x11_error = 0;
+  {
+    ScopedX11ErrorTrap trap(display_);
+    probe_image = XGetImage(display_, root_, first_display.left,
+                            first_display.top, 1, 1, AllPlanes, ZPixmap);
+    x11_error = trap.SyncAndGetError();
+  }
+
+  if (x11_error != 0 || !probe_image) {
+    LOG_WARN("X11 probe XGetImage failed: x11_error={}, image={}", x11_error,
+             probe_image ? "valid" : "null");
+    return false;
+  }
+
+  const bool red_in_low_byte = (probe_image->red_mask & 0x000000FFu) != 0;
+  const bool blue_in_low_byte = (probe_image->blue_mask & 0x000000FFu) != 0;
+  use_abgr_to_nv12_ = red_in_low_byte && !blue_in_low_byte;
+
+  XDestroyImage(probe_image);
+
+  return true;
 }
 }  // namespace crossdesk

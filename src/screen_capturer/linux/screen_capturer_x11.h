@@ -17,6 +17,7 @@ struct _XImage;
 typedef struct _XImage XImage;
 
 #include <atomic>
+#include <cctype>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -42,6 +43,7 @@ class ScreenCapturerX11 : public ScreenCapturer {
   int Resume(int monitor_index) override;
 
   int SwitchTo(int monitor_index) override;
+  int ResetToInitialMonitor() override;
 
   std::vector<DisplayInfo> GetDisplayInfoList() override;
 
@@ -49,6 +51,7 @@ class ScreenCapturerX11 : public ScreenCapturer {
 
  private:
   void DrawCursor(XImage* image, int x, int y);
+  bool ProbeCapture();
 
  private:
   Display* display_ = nullptr;
@@ -62,10 +65,13 @@ class ScreenCapturerX11 : public ScreenCapturer {
   std::atomic<bool> running_{false};
   std::atomic<bool> paused_{false};
   std::atomic<int> monitor_index_{0};
+  int initial_monitor_index_ = 0;
   std::atomic<bool> show_cursor_{true};
   int fps_ = 60;
   cb_desktop_data callback_;
   std::vector<DisplayInfo> display_info_list_;
+  int capture_error_count_ = 0;
+  bool use_abgr_to_nv12_ = false;
 
   std::vector<uint8_t> y_plane_;
   std::vector<uint8_t> uv_plane_;

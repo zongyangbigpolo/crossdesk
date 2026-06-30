@@ -15,7 +15,7 @@ namespace crossdesk {
 
 class ConfigCenter {
  public:
-  enum class LANGUAGE { CHINESE = 0, ENGLISH = 1 };
+  enum class LANGUAGE { CHINESE = 0, ENGLISH = 1, RUSSIAN = 2 };
   enum class VIDEO_QUALITY { LOW = 0, MEDIUM = 1, HIGH = 2 };
   enum class VIDEO_FRAME_RATE { FPS_30 = 0, FPS_60 = 1 };
   enum class VIDEO_ENCODE_FORMAT { H264 = 0, AV1 = 1 };
@@ -71,7 +71,7 @@ class ConfigCenter {
   const char* section_ = "Settings";
 
   LANGUAGE language_ = LANGUAGE::CHINESE;
-  VIDEO_QUALITY video_quality_ = VIDEO_QUALITY::MEDIUM;
+  VIDEO_QUALITY video_quality_ = VIDEO_QUALITY::HIGH;
   VIDEO_FRAME_RATE video_frame_rate_ = VIDEO_FRAME_RATE::FPS_60;
   VIDEO_ENCODE_FORMAT video_encode_format_ = VIDEO_ENCODE_FORMAT::H264;
   bool hardware_video_codec_ = false;

@@ -20,11 +20,15 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "IconsFontAwesome6.h"
 #include "config_center.h"
+#include "crossdesk_core.h"
+#include "crossdesk_core_internal.h"
 #include "device_controller_factory.h"
+#include "device_presence.h"
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlrenderer3.h"
@@ -42,6 +46,14 @@
 namespace crossdesk {
 class Render {
  public:
+  enum class RemoteUnlockState {
+    none,
+    service_unavailable,
+    lock_screen,
+    credential_ui,
+    secure_desktop,
+  };
+
   struct FileTransferState {
     std::atomic<bool> file_sending_ = false;
     std::atomic<uint64_t> file_sent_bytes_ = 0;
@@ -52,6 +64,7 @@ class Render {
     std::chrono::steady_clock::time_point file_send_last_update_time_;
     uint64_t file_send_last_bytes_ = 0;
     bool file_transfer_window_visible_ = false;
+    bool file_transfer_window_hovered_ = false;
     std::atomic<uint32_t> current_file_id_{0};
 
     struct QueuedFile {
@@ -82,6 +95,8 @@ class Render {
     PeerPtr* peer_ = nullptr;
     std::string audio_label_ = "control_audio";
     std::string data_label_ = "data";
+    std::string mouse_label_ = "mouse";
+    std::string keyboard_label_ = "keyboard";
     std::string file_label_ = "file";
     std::string control_data_label_ = "control_data";
     std::string file_feedback_label_ = "file_feedback";
@@ -94,7 +109,7 @@ class Render {
     bool connection_established_ = false;
     bool rejoin_ = false;
     bool net_traffic_stats_button_pressed_ = false;
-    bool mouse_control_button_pressed_ = true;
+    bool enable_mouse_control_ = true;
     bool mouse_controller_is_started_ = false;
     bool audio_capture_button_pressed_ = true;
     bool control_mouse_ = true;
@@ -155,10 +170,14 @@ class Render {
     std::string mouse_control_button_label_ = "Mouse Control";
     std::string audio_capture_button_label_ = "Audio Capture";
     std::string remote_host_name_ = "";
+    bool remote_service_status_received_ = false;
+    bool remote_service_available_ = false;
+    std::string remote_interactive_stage_ = "";
     std::vector<DisplayInfo> display_info_list_;
     SDL_Texture* stream_texture_ = nullptr;
     uint8_t* argb_buffer_ = nullptr;
     int argb_buffer_size_ = 0;
+    SDL_FRect stream_render_rect_f_ = {0.0f, 0.0f, 0.0f, 0.0f};
     SDL_Rect stream_render_rect_;
     SDL_Rect stream_render_rect_last_;
     ImVec2 control_window_pos_;
@@ -192,6 +211,8 @@ class Render {
   void UpdateLabels();
   void UpdateInteractions();
   void HandleRecentConnections();
+  void HandleConnectionStatusChange();
+  void HandlePendingPresenceProbe();
   void HandleStreamWindow();
   void HandleServerWindow();
   void Cleanup();
@@ -233,6 +254,7 @@ class Render {
   bool ConnectionStatusWindow(
       std::shared_ptr<SubStreamWindowProperties>& props);
   int ShowRecentConnections();
+  bool OpenUrl(const std::string& url);
   void Hyperlink(const std::string& label, const std::string& url,
                  const float window_width);
   int FileTransferWindow(std::shared_ptr<SubStreamWindowProperties>& props);
@@ -240,7 +262,9 @@ class Render {
 
  private:
   int ConnectTo(const std::string& remote_id, const char* password,
-                bool remember_password);
+                bool remember_password, bool bypass_presence_check = false);
+  int RequestSingleDevicePresence(const std::string& remote_id,
+                                  const char* password, bool remember_password);
   int CreateMainWindow();
   int DestroyMainWindow();
   int CreateStreamWindow();
@@ -255,9 +279,17 @@ class Render {
   int DrawStreamWindow();
   int DrawServerWindow();
   int ConfirmDeleteConnection();
+  int OfflineWarningWindow();
   int NetTrafficStats(std::shared_ptr<SubStreamWindowProperties>& props);
   void DrawConnectionStatusText(
       std::shared_ptr<SubStreamWindowProperties>& props);
+  void DrawReceivingScreenText(
+      std::shared_ptr<SubStreamWindowProperties>& props);
+  void ResetRemoteServiceStatus(SubStreamWindowProperties& props);
+  void ApplyRemoteServiceStatus(SubStreamWindowProperties& props,
+                                const ServiceStatus& status);
+  RemoteUnlockState GetRemoteUnlockState(
+      const SubStreamWindowProperties& props) const;
 #ifdef __APPLE__
   int RequestPermissionWindow();
   bool CheckScreenRecordingPermission();
@@ -286,6 +318,9 @@ class Render {
   static void OnSignalStatusCb(SignalStatus status, const char* user_id,
                                size_t user_id_size, void* user_data);
 
+  static void OnSignalMessageCb(const char* message, size_t size,
+                                void* user_data);
+
   static void OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
                                    size_t user_id_size, void* user_data);
 
@@ -306,7 +341,12 @@ class Render {
   static void FreeRemoteAction(RemoteAction& action);
 
  private:
-  int SendKeyCommand(int key_code, bool is_down);
+  int SendKeyCommand(int key_code, bool is_down, uint32_t scan_code = 0,
+                     bool extended = false);
+  static bool IsModifierVkKey(int key_code);
+  void TrackPressedKeyState(int key_code, bool is_down);
+  void ForceReleasePressedKeys();
+  int ProcessKeyboardEvent(const SDL_Event& event);
   int ProcessMouseEvent(const SDL_Event& event);
 
   static void SdlCaptureAudioIn(void* userdata, Uint8* stream, int len);
@@ -340,6 +380,10 @@ class Render {
 
   int AudioDeviceInit();
   int AudioDeviceDestroy();
+  void HandleWindowsServiceIntegration();
+#if _WIN32
+  void ResetLocalWindowsServiceState(bool clear_pending_sas);
+#endif
 
  private:
   struct CDCache {
@@ -376,7 +420,11 @@ class Render {
   CDCache cd_cache_;
   CDCacheV2 cd_cache_v2_;
   std::mutex cd_cache_mutex_;
-  std::unique_ptr<ConfigCenter> config_center_;
+  // ConfigCenter and DevicePresence are owned by crossdesk_core; these are
+  // non-owning views fetched in Init() via cd_internal_get_*. Lifetime ties
+  // to core_, destroyed in ~Render.
+  cd_core_t* core_ = nullptr;
+  ConfigCenter* config_center_ = nullptr;
   ConfigCenter::LANGUAGE localization_language_ =
       ConfigCenter::LANGUAGE::CHINESE;
   std::unique_ptr<PathManager> path_manager_;
@@ -402,9 +450,12 @@ class Render {
   // recent connections
   std::vector<std::pair<std::string, Thumbnail::RecentConnection>>
       recent_connections_;
+  std::vector<std::string> recent_connection_ids_;
   int recent_connection_image_width_ = 160;
   int recent_connection_image_height_ = 90;
   uint32_t recent_connection_image_save_time_ = 0;
+  DevicePresence* device_presence_ = nullptr;
+  bool need_to_send_recent_connections_ = true;
 
   // main window render
   SDL_Window* main_window_ = nullptr;
@@ -430,9 +481,10 @@ class Render {
   bool screen_capturer_is_started_ = false;
   bool start_speaker_capturer_ = false;
   bool speaker_capturer_is_started_ = false;
-  bool start_keyboard_capturer_ = true;
+  bool start_keyboard_capturer_ = false;
   bool show_cursor_ = false;
   bool keyboard_capturer_is_started_ = false;
+  bool keyboard_capturer_uses_sdl_events_ = false;
   bool foucs_on_main_window_ = false;
   bool focus_on_stream_window_ = false;
   bool main_window_minimized_ = false;
@@ -488,9 +540,19 @@ class Render {
   std::string controlled_remote_id_ = "";
   std::string focused_remote_id_ = "";
   std::string remote_client_id_ = "";
+  std::unordered_set<int> pressed_keyboard_keys_;
+  std::mutex pressed_keyboard_keys_mutex_;
   SDL_Event last_mouse_event;
   SDL_AudioStream* output_stream_;
   uint32_t STREAM_REFRESH_EVENT = 0;
+#if _WIN32
+  std::atomic<bool> pending_windows_service_sas_{false};
+  bool local_service_status_received_ = false;
+  bool local_service_available_ = false;
+  std::string local_interactive_stage_;
+  uint32_t last_local_secure_input_block_log_tick_ = 0;
+  uint32_t last_windows_service_status_tick_ = 0;
+#endif
 
   // stream window render
   SDL_Window* stream_window_ = nullptr;
@@ -534,6 +596,8 @@ class Render {
   int server_window_normal_height_ = 150;
   float server_window_dpi_scaling_w_ = 1.0f;
   float server_window_dpi_scaling_h_ = 1.0f;
+  float window_rounding_ = 6.0f;
+  float window_rounding_default_ = 6.0f;
 
   // server window collapsed mode
   bool server_window_collapsed_ = false;
@@ -569,9 +633,11 @@ class Render {
   bool is_server_mode_ = false;
   bool reload_recent_connections_ = true;
   bool show_confirm_delete_connection_ = false;
+  bool show_offline_warning_window_ = false;
   bool delete_connection_ = false;
   bool is_tab_bar_hovered_ = false;
   std::string delete_connection_name_ = "";
+  std::string offline_warning_text_ = "";
   bool re_enter_remote_id_ = false;
   double copy_start_time_ = 0;
   SignalStatus signal_status_ = SignalStatus::SignalClosed;
@@ -583,6 +649,8 @@ class Render {
   std::string video_secondary_label_ = "secondary_display";
   std::string audio_label_ = "audio";
   std::string data_label_ = "data";
+  std::string mouse_label_ = "mouse";
+  std::string keyboard_label_ = "keyboard";
   std::string info_label_ = "info";
   std::string control_data_label_ = "control_data";
   std::string file_label_ = "file";
@@ -622,10 +690,10 @@ class Render {
   char self_hosted_id_[17] = "";
   char self_hosted_user_id_[17] = "";
   int language_button_value_ = 0;
-  int video_quality_button_value_ = 0;
+  int video_quality_button_value_ = 2;
   int video_frame_rate_button_value_ = 1;
   int video_encode_format_button_value_ = 0;
-  bool enable_hardware_video_codec_ = false;
+  bool enable_hardware_video_codec_ = true;
   bool enable_turn_ = true;
   bool enable_srtp_ = false;
   char signal_server_ip_[256] = "api.crossdesk.cn";
@@ -674,6 +742,13 @@ class Render {
   std::unordered_map<std::string, std::string> connection_host_names_;
   std::string selected_server_remote_id_ = "";
   std::string selected_server_remote_hostname_ = "";
+  std::mutex pending_presence_probe_mutex_;
+  bool pending_presence_probe_ = false;
+  bool pending_presence_result_ready_ = false;
+  bool pending_presence_online_ = false;
+  std::string pending_presence_remote_id_ = "";
+  std::string pending_presence_password_ = "";
+  bool pending_presence_remember_password_ = false;
   FileTransferState file_transfer_;
 };
 }  // namespace crossdesk

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -6,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "clipboard.h"
 #include "device_controller.h"
@@ -15,45 +17,542 @@
 #include "platform.h"
 #include "rd_log.h"
 #include "render.h"
+#include "windows_key_metadata.h"
+#if _WIN32
+#include "interactive_state.h"
+#include "service_host.h"
+#endif
 
 #define NV12_BUFFER_SIZE 1280 * 720 * 3 / 2
 
 namespace crossdesk {
 
-int Render::SendKeyCommand(int key_code, bool is_down) {
-  RemoteAction remote_action;
+namespace {
+
+int TranslateSdlKeypadScancodeToVk(const SDL_KeyboardEvent& event) {
+  const bool numlock_enabled = (event.mod & SDL_KMOD_NUM) != 0;
+
+  switch (event.scancode) {
+    case SDL_SCANCODE_NUMLOCKCLEAR:
+      return 0x90;
+    case SDL_SCANCODE_KP_ENTER:
+      return 0x0D;
+    case SDL_SCANCODE_KP_0:
+      if (!numlock_enabled) {
+        return 0x2D;
+      }
+      return 0x60;
+    case SDL_SCANCODE_KP_1:
+      if (!numlock_enabled) {
+        return 0x23;
+      }
+      return 0x61;
+    case SDL_SCANCODE_KP_2:
+      if (!numlock_enabled) {
+        return 0x28;
+      }
+      return 0x62;
+    case SDL_SCANCODE_KP_3:
+      if (!numlock_enabled) {
+        return 0x22;
+      }
+      return 0x63;
+    case SDL_SCANCODE_KP_4:
+      if (!numlock_enabled) {
+        return 0x25;
+      }
+      return 0x64;
+    case SDL_SCANCODE_KP_5:
+      return 0x65;
+    case SDL_SCANCODE_KP_6:
+      if (!numlock_enabled) {
+        return 0x27;
+      }
+      return 0x66;
+    case SDL_SCANCODE_KP_7:
+      if (!numlock_enabled) {
+        return 0x24;
+      }
+      return 0x67;
+    case SDL_SCANCODE_KP_8:
+      if (!numlock_enabled) {
+        return 0x26;
+      }
+      return 0x68;
+    case SDL_SCANCODE_KP_9:
+      if (!numlock_enabled) {
+        return 0x21;
+      }
+      return 0x69;
+    case SDL_SCANCODE_KP_PERIOD:
+    case SDL_SCANCODE_KP_COMMA:
+      if (!numlock_enabled) {
+        return 0x2E;
+      }
+      return 0x6E;
+    case SDL_SCANCODE_KP_DIVIDE:
+      return 0x6F;
+    case SDL_SCANCODE_KP_MULTIPLY:
+      return 0x6A;
+    case SDL_SCANCODE_KP_MINUS:
+      return 0x6D;
+    case SDL_SCANCODE_KP_PLUS:
+      return 0x6B;
+    case SDL_SCANCODE_KP_EQUALS:
+      return 0xBB;
+    default:
+      return -1;
+  }
+}
+
+int TranslateSdlKeyboardEventToVk(const SDL_KeyboardEvent& event) {
+  const int keypad_key_code = TranslateSdlKeypadScancodeToVk(event);
+  if (keypad_key_code >= 0) {
+    return keypad_key_code;
+  }
+
+  const int key = static_cast<int>(event.key);
+  if (key >= 'a' && key <= 'z') {
+    return key - 'a' + 0x41;
+  }
+  if (key >= 'A' && key <= 'Z') {
+    return key;
+  }
+  if (key >= '0' && key <= '9') {
+    return key;
+  }
+
+  switch (key) {
+    case ';':
+      return 0xBA;
+    case '\'':
+      return 0xDE;
+    case '`':
+      return 0xC0;
+    case ',':
+      return 0xBC;
+    case '.':
+      return 0xBE;
+    case '/':
+      return 0xBF;
+    case '\\':
+      return 0xDC;
+    case '[':
+      return 0xDB;
+    case ']':
+      return 0xDD;
+    case '-':
+      return 0xBD;
+    case '=':
+      return 0xBB;
+    default:
+      break;
+  }
+
+  switch (event.scancode) {
+    case SDL_SCANCODE_ESCAPE:
+      return 0x1B;
+    case SDL_SCANCODE_RETURN:
+      return 0x0D;
+    case SDL_SCANCODE_SPACE:
+      return 0x20;
+    case SDL_SCANCODE_BACKSPACE:
+      return 0x08;
+    case SDL_SCANCODE_TAB:
+      return 0x09;
+    case SDL_SCANCODE_PRINTSCREEN:
+      return 0x2C;
+    case SDL_SCANCODE_SCROLLLOCK:
+      return 0x91;
+    case SDL_SCANCODE_PAUSE:
+      return 0x13;
+    case SDL_SCANCODE_INSERT:
+      return 0x2D;
+    case SDL_SCANCODE_DELETE:
+      return 0x2E;
+    case SDL_SCANCODE_HOME:
+      return 0x24;
+    case SDL_SCANCODE_END:
+      return 0x23;
+    case SDL_SCANCODE_PAGEUP:
+      return 0x21;
+    case SDL_SCANCODE_PAGEDOWN:
+      return 0x22;
+    case SDL_SCANCODE_LEFT:
+      return 0x25;
+    case SDL_SCANCODE_RIGHT:
+      return 0x27;
+    case SDL_SCANCODE_UP:
+      return 0x26;
+    case SDL_SCANCODE_DOWN:
+      return 0x28;
+    case SDL_SCANCODE_F1:
+      return 0x70;
+    case SDL_SCANCODE_F2:
+      return 0x71;
+    case SDL_SCANCODE_F3:
+      return 0x72;
+    case SDL_SCANCODE_F4:
+      return 0x73;
+    case SDL_SCANCODE_F5:
+      return 0x74;
+    case SDL_SCANCODE_F6:
+      return 0x75;
+    case SDL_SCANCODE_F7:
+      return 0x76;
+    case SDL_SCANCODE_F8:
+      return 0x77;
+    case SDL_SCANCODE_F9:
+      return 0x78;
+    case SDL_SCANCODE_F10:
+      return 0x79;
+    case SDL_SCANCODE_F11:
+      return 0x7A;
+    case SDL_SCANCODE_F12:
+      return 0x7B;
+    case SDL_SCANCODE_CAPSLOCK:
+      return 0x14;
+    case SDL_SCANCODE_LSHIFT:
+      return 0xA0;
+    case SDL_SCANCODE_RSHIFT:
+      return 0xA1;
+    case SDL_SCANCODE_LCTRL:
+      return 0xA2;
+    case SDL_SCANCODE_RCTRL:
+      return 0xA3;
+    case SDL_SCANCODE_LALT:
+      return 0xA4;
+    case SDL_SCANCODE_RALT:
+      return 0xA5;
+    case SDL_SCANCODE_LGUI:
+      return 0x5B;
+    case SDL_SCANCODE_RGUI:
+      return 0x5C;
+    default:
+      return -1;
+  }
+}
+
+int NormalizeWindowsModifierVk(int key_code, uint32_t scan_code,
+                               bool extended) {
+#if _WIN32
+  if (key_code != 0x10 && key_code != 0x11 && key_code != 0x12) {
+    return key_code;
+  }
+
+  UINT scan_code_with_prefix = static_cast<UINT>(scan_code & 0xFF);
+  if (extended) {
+    scan_code_with_prefix |= 0xE000;
+  }
+
+  const UINT normalized_vk =
+      MapVirtualKeyW(scan_code_with_prefix, MAPVK_VSC_TO_VK_EX);
+  return normalized_vk != 0 ? static_cast<int>(normalized_vk) : key_code;
+#else
+  (void)scan_code;
+  (void)extended;
+  return key_code;
+#endif
+}
+
+void PopulateWindowsKeyMetadataFromVk(int key_code, uint32_t* scan_code_out,
+                                      bool* extended_out) {
+  if (scan_code_out == nullptr || extended_out == nullptr) {
+    return;
+  }
+
+#if _WIN32
+  const UINT scan_code =
+      MapVirtualKeyW(static_cast<UINT>(key_code), MAPVK_VK_TO_VSC_EX);
+  if (scan_code == 0) {
+    LookupWindowsKeyMetadataFromVk(key_code, scan_code_out, extended_out);
+    return;
+  }
+
+  *scan_code_out = static_cast<uint32_t>(scan_code & 0xFF);
+  *extended_out = (scan_code & 0xFF00) != 0;
+#else
+  LookupWindowsKeyMetadataFromVk(key_code, scan_code_out, extended_out);
+#endif
+}
+
+#if _WIN32
+constexpr uint32_t kSecureDesktopInputLogIntervalMs = 2000;
+
+bool BuildAbsoluteMousePosition(const std::vector<DisplayInfo>& displays,
+                                int display_index, float normalized_x,
+                                float normalized_y, int* absolute_x_out,
+                                int* absolute_y_out) {
+  if (absolute_x_out == nullptr || absolute_y_out == nullptr ||
+      display_index < 0 || display_index >= static_cast<int>(displays.size())) {
+    return false;
+  }
+
+  const DisplayInfo& display = displays[display_index];
+  if (display.width <= 0 || display.height <= 0) {
+    return false;
+  }
+
+  const float clamped_x = std::clamp(normalized_x, 0.0f, 1.0f);
+  const float clamped_y = std::clamp(normalized_y, 0.0f, 1.0f);
+  *absolute_x_out = static_cast<int>(clamped_x * display.width) + display.left;
+  *absolute_y_out = static_cast<int>(clamped_y * display.height) + display.top;
+  return true;
+}
+
+void LogSecureDesktopInputBlocked(uint32_t* last_tick, const char* side,
+                                  const char* stage) {
+  if (last_tick == nullptr) {
+    return;
+  }
+
+  const uint32_t now = static_cast<uint32_t>(SDL_GetTicks());
+  if (*last_tick != 0 && now - *last_tick < kSecureDesktopInputLogIntervalMs) {
+    return;
+  }
+
+  *last_tick = now;
+  LOG_WARN(
+      "{} secure-desktop input blocked, stage={}, normal SendInput path "
+      "cannot drive the Windows password UI",
+      side != nullptr ? side : "unknown", stage != nullptr ? stage : "");
+}
+#endif
+
+}  // namespace
+
+void Render::OnSignalMessageCb(const char* message, size_t size,
+                               void* user_data) {
+  Render* render = (Render*)user_data;
+  if (!render || !message || size == 0) {
+    return;
+  }
+  std::string s(message, size);
+  auto j = nlohmann::json::parse(s, nullptr, false);
+  if (j.is_discarded() || !j.contains("type") || !j["type"].is_string()) {
+    return;
+  }
+  std::string type = j["type"].get<std::string>();
+  if (type == "presence") {
+    if (j.contains("devices") && j["devices"].is_array()) {
+      for (auto& dev : j["devices"]) {
+        if (!dev.is_object()) {
+          continue;
+        }
+        if (!dev.contains("id") || !dev["id"].is_string()) {
+          continue;
+        }
+        if (!dev.contains("online") || !dev["online"].is_boolean()) {
+          continue;
+        }
+        std::string id = dev["id"].get<std::string>();
+        bool online = dev["online"].get<bool>();
+        render->device_presence_->SetOnline(id, online);
+        {
+          std::lock_guard<std::mutex> lock(
+              render->pending_presence_probe_mutex_);
+          if (render->pending_presence_probe_ &&
+              render->pending_presence_remote_id_ == id) {
+            render->pending_presence_result_ready_ = true;
+            render->pending_presence_online_ = online;
+          }
+        }
+      }
+    }
+  } else if (type == "presence_update") {
+    if (j.contains("id") && j["id"].is_string() && j.contains("online") &&
+        j["online"].is_boolean()) {
+      std::string id = j["id"].get<std::string>();
+      bool online = j["online"].get<bool>();
+      if (!id.empty()) {
+        render->device_presence_->SetOnline(id, online);
+        {
+          std::lock_guard<std::mutex> lock(
+              render->pending_presence_probe_mutex_);
+          if (render->pending_presence_probe_ &&
+              render->pending_presence_remote_id_ == id) {
+            render->pending_presence_result_ready_ = true;
+            render->pending_presence_online_ = online;
+          }
+        }
+      }
+    }
+  }
+}
+
+bool Render::IsModifierVkKey(int key_code) {
+  switch (key_code) {
+    case 0x10:  // VK_SHIFT
+    case 0x11:  // VK_CONTROL
+    case 0x12:  // VK_MENU(ALT)
+    case 0x5B:  // VK_LWIN
+    case 0x5C:  // VK_RWIN
+    case 0xA0:  // VK_LSHIFT
+    case 0xA1:  // VK_RSHIFT
+    case 0xA2:  // VK_LCONTROL
+    case 0xA3:  // VK_RCONTROL
+    case 0xA4:  // VK_LMENU
+    case 0xA5:  // VK_RMENU
+      return true;
+    default:
+      return false;
+  }
+}
+
+void Render::TrackPressedKeyState(int key_code, bool is_down) {
+  if (!IsWaylandSession() && !IsModifierVkKey(key_code)) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(pressed_keyboard_keys_mutex_);
+  if (is_down) {
+    pressed_keyboard_keys_.insert(key_code);
+  } else {
+    pressed_keyboard_keys_.erase(key_code);
+  }
+}
+
+void Render::ForceReleasePressedKeys() {
+  std::vector<int> pressed_keys;
+  {
+    std::lock_guard<std::mutex> lock(pressed_keyboard_keys_mutex_);
+    if (pressed_keyboard_keys_.empty()) {
+      return;
+    }
+    pressed_keys.assign(pressed_keyboard_keys_.begin(),
+                        pressed_keyboard_keys_.end());
+    pressed_keyboard_keys_.clear();
+  }
+
+  for (int key_code : pressed_keys) {
+    SendKeyCommand(key_code, false);
+  }
+}
+
+int Render::SendKeyCommand(int key_code, bool is_down, uint32_t scan_code,
+                           bool extended) {
+  RemoteAction remote_action{};
   remote_action.type = ControlType::keyboard;
   if (is_down) {
     remote_action.k.flag = KeyFlag::key_down;
   } else {
     remote_action.k.flag = KeyFlag::key_up;
   }
-  remote_action.k.key_value = key_code;
 
-  if (!controlled_remote_id_.empty()) {
-    // std::shared_lock lock(client_properties_mutex_);
-    if (client_properties_.find(controlled_remote_id_) !=
-        client_properties_.end()) {
-      auto props = client_properties_[controlled_remote_id_];
-      if (props->connection_status_ == ConnectionStatus::Connected) {
+  if (scan_code == 0) {
+    PopulateWindowsKeyMetadataFromVk(key_code, &scan_code, &extended);
+  }
+#if _WIN32
+  key_code = NormalizeWindowsModifierVk(key_code, scan_code, extended);
+#endif
+
+  remote_action.k.key_value = key_code;
+  remote_action.k.scan_code = scan_code;
+  remote_action.k.extended = extended;
+
+  std::string target_id = controlled_remote_id_.empty() ? focused_remote_id_
+                                                        : controlled_remote_id_;
+  if (!target_id.empty()) {
+    if (client_properties_.find(target_id) != client_properties_.end()) {
+      auto props = client_properties_[target_id];
+      if (props->connection_status_ == ConnectionStatus::Connected &&
+          props->peer_) {
         std::string msg = remote_action.to_json();
-        if (props->peer_) {
-          SendDataFrame(props->peer_, msg.c_str(), msg.size(),
-                        props->data_label_.c_str());
+        int ret = SendReliableDataFrame(props->peer_, msg.c_str(), msg.size(),
+                                        props->keyboard_label_.c_str());
+        if (ret != 0) {
+          LOG_WARN("Send keyboard command failed, remote_id={}, ret={}",
+                   target_id, ret);
         }
       }
     }
   }
 
+  TrackPressedKeyState(key_code, is_down);
+
   return 0;
+}
+
+int Render::ProcessKeyboardEvent(const SDL_Event& event) {
+  if (event.type != SDL_EVENT_KEY_DOWN && event.type != SDL_EVENT_KEY_UP) {
+    return -1;
+  }
+
+  if (event.type == SDL_EVENT_KEY_DOWN && event.key.repeat) {
+    return 0;
+  }
+
+  const int key_code = TranslateSdlKeyboardEventToVk(event.key);
+  if (key_code < 0) {
+    return 0;
+  }
+
+  return SendKeyCommand(key_code, event.type == SDL_EVENT_KEY_DOWN);
 }
 
 int Render::ProcessMouseEvent(const SDL_Event& event) {
   controlled_remote_id_ = "";
-  int video_width, video_height = 0;
-  int render_width, render_height = 0;
-  float ratio_x, ratio_y = 0;
   RemoteAction remote_action;
+  float cursor_x = last_mouse_event.motion.x;
+  float cursor_y = last_mouse_event.motion.y;
+
+  auto normalize_cursor_to_window_space = [&](float* x, float* y) {
+    if (!x || !y || !stream_window_) {
+      return;
+    }
+
+    int window_width = 0;
+    int window_height = 0;
+    int pixel_width = 0;
+    int pixel_height = 0;
+    SDL_GetWindowSize(stream_window_, &window_width, &window_height);
+    SDL_GetWindowSizeInPixels(stream_window_, &pixel_width, &pixel_height);
+
+    if (window_width <= 0 || window_height <= 0 || pixel_width <= 0 ||
+        pixel_height <= 0) {
+      return;
+    }
+
+    if ((window_width != pixel_width || window_height != pixel_height) &&
+        (*x > static_cast<float>(window_width) + 1.0f ||
+         *y > static_cast<float>(window_height) + 1.0f)) {
+      const float scale_x =
+          static_cast<float>(window_width) / static_cast<float>(pixel_width);
+      const float scale_y =
+          static_cast<float>(window_height) / static_cast<float>(pixel_height);
+      *x *= scale_x;
+      *y *= scale_y;
+
+      static bool logged_pixel_to_window_conversion = false;
+      if (!logged_pixel_to_window_conversion) {
+        LOG_INFO(
+            "Mouse coordinate space converted from pixels to window units: "
+            "window={}x{}, pixels={}x{}, scale=({:.4f},{:.4f})",
+            window_width, window_height, pixel_width, pixel_height, scale_x,
+            scale_y);
+        logged_pixel_to_window_conversion = true;
+      }
+    }
+  };
+
+  if (event.type == SDL_EVENT_MOUSE_MOTION) {
+    cursor_x = event.motion.x;
+    cursor_y = event.motion.y;
+    normalize_cursor_to_window_space(&cursor_x, &cursor_y);
+  } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+             event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+    cursor_x = event.button.x;
+    cursor_y = event.button.y;
+    normalize_cursor_to_window_space(&cursor_x, &cursor_y);
+  } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+    cursor_x = last_mouse_event.motion.x;
+    cursor_y = last_mouse_event.motion.y;
+  }
+
+  const bool is_pointer_position_event =
+      (event.type == SDL_EVENT_MOUSE_MOTION ||
+       event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+       event.type == SDL_EVENT_MOUSE_BUTTON_UP);
 
   // std::shared_lock lock(client_properties_mutex_);
   for (auto& it : client_properties_) {
@@ -62,23 +561,31 @@ int Render::ProcessMouseEvent(const SDL_Event& event) {
       continue;
     }
 
-    if (event.button.x >= props->stream_render_rect_.x &&
-        event.button.x <=
-            props->stream_render_rect_.x + props->stream_render_rect_.w &&
-        event.button.y >= props->stream_render_rect_.y &&
-        event.button.y <=
-            props->stream_render_rect_.y + props->stream_render_rect_.h) {
-      controlled_remote_id_ = it.first;
-      render_width = props->stream_render_rect_.w;
-      render_height = props->stream_render_rect_.h;
-      last_mouse_event.button.x = event.button.x;
-      last_mouse_event.button.y = event.button.y;
+    const bool file_transfer_window_hovered =
+        props->file_transfer_.file_transfer_window_hovered_;
+    const bool overlay_hovered = props->control_bar_hovered_ ||
+                                 props->display_selectable_hovered_ ||
+                                 file_transfer_window_hovered;
 
-      remote_action.m.x =
-          (float)(event.button.x - props->stream_render_rect_.x) / render_width;
-      remote_action.m.y =
-          (float)(event.button.y - props->stream_render_rect_.y) /
-          render_height;
+    const SDL_FRect render_rect = props->stream_render_rect_f_;
+    if (render_rect.w <= 1.0f || render_rect.h <= 1.0f) {
+      continue;
+    }
+
+    if (is_pointer_position_event && cursor_x >= render_rect.x &&
+        cursor_x <= render_rect.x + render_rect.w &&
+        cursor_y >= render_rect.y &&
+        cursor_y <= render_rect.y + render_rect.h) {
+      controlled_remote_id_ = it.first;
+      last_mouse_event.motion.x = cursor_x;
+      last_mouse_event.motion.y = cursor_y;
+      last_mouse_event.button.x = cursor_x;
+      last_mouse_event.button.y = cursor_y;
+
+      remote_action.m.x = (cursor_x - render_rect.x) / render_rect.w;
+      remote_action.m.y = (cursor_y - render_rect.y) / render_rect.h;
+      remote_action.m.x = std::clamp(remote_action.m.x, 0.0f, 1.0f);
+      remote_action.m.y = std::clamp(remote_action.m.y, 0.0f, 1.0f);
 
       if (SDL_EVENT_MOUSE_BUTTON_DOWN == event.type) {
         remote_action.type = ControlType::mouse;
@@ -103,21 +610,19 @@ int Render::ProcessMouseEvent(const SDL_Event& event) {
         remote_action.m.flag = MouseFlag::move;
       }
 
-      if (props->control_bar_hovered_ || props->display_selectable_hovered_) {
+      if (overlay_hovered) {
         break;
       }
       if (props->peer_) {
         std::string msg = remote_action.to_json();
         SendDataFrame(props->peer_, msg.c_str(), msg.size(),
-                      props->data_label_.c_str());
+                      props->mouse_label_.c_str());
       }
     } else if (SDL_EVENT_MOUSE_WHEEL == event.type &&
-               last_mouse_event.button.x >= props->stream_render_rect_.x &&
-               last_mouse_event.button.x <= props->stream_render_rect_.x +
-                                                props->stream_render_rect_.w &&
-               last_mouse_event.button.y >= props->stream_render_rect_.y &&
-               last_mouse_event.button.y <= props->stream_render_rect_.y +
-                                                props->stream_render_rect_.h) {
+               last_mouse_event.button.x >= render_rect.x &&
+               last_mouse_event.button.x <= render_rect.x + render_rect.w &&
+               last_mouse_event.button.y >= render_rect.y &&
+               last_mouse_event.button.y <= render_rect.y + render_rect.h) {
       float scroll_x = event.wheel.x;
       float scroll_y = event.wheel.y;
       if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
@@ -144,22 +649,20 @@ int Render::ProcessMouseEvent(const SDL_Event& event) {
         remote_action.m.s = roundUp(scroll_x);
       }
 
-      render_width = props->stream_render_rect_.w;
-      render_height = props->stream_render_rect_.h;
-      remote_action.m.x =
-          (float)(last_mouse_event.button.x - props->stream_render_rect_.x) /
-          render_width;
-      remote_action.m.y =
-          (float)(last_mouse_event.button.y - props->stream_render_rect_.y) /
-          render_height;
+      remote_action.m.x = (last_mouse_event.button.x - render_rect.x) /
+                          (std::max)(render_rect.w, 1.0f);
+      remote_action.m.y = (last_mouse_event.button.y - render_rect.y) /
+                          (std::max)(render_rect.h, 1.0f);
+      remote_action.m.x = std::clamp(remote_action.m.x, 0.0f, 1.0f);
+      remote_action.m.y = std::clamp(remote_action.m.y, 0.0f, 1.0f);
 
-      if (props->control_bar_hovered_) {
+      if (overlay_hovered) {
         continue;
       }
       if (props->peer_) {
         std::string msg = remote_action.to_json();
         SendDataFrame(props->peer_, msg.c_str(), msg.size(),
-                      props->data_label_.c_str());
+                      props->mouse_label_.c_str());
       }
     }
   }
@@ -354,6 +857,13 @@ void Render::OnReceiveDataBufferCb(const char* data, size_t size,
     return;
   } else if (source_id == render->clipboard_label_) {
     if (size > 0) {
+      std::string remote_user_id(user_id, user_id_size);
+      auto props =
+          render->GetSubStreamWindowPropertiesByRemoteId(remote_user_id);
+      if (props && !props->enable_mouse_control_) {
+        return;
+      }
+
       std::string clipboard_text(data, size);
       if (!Clipboard::SetText(clipboard_text)) {
         LOG_ERROR("Failed to set clipboard content from remote");
@@ -533,16 +1043,31 @@ void Render::OnReceiveDataBufferCb(const char* data, size_t size,
   }
 
   std::string json_str(data, size);
-  RemoteAction remote_action;
-
-  try {
-    remote_action.from_json(json_str);
-  } catch (const std::exception& e) {
-    LOG_ERROR("Failed to parse RemoteAction JSON: {}", e.what());
+  RemoteAction remote_action{};
+  if (!remote_action.from_json(json_str)) {
+    LOG_ERROR("Failed to parse RemoteAction JSON payload");
     return;
   }
 
   std::string remote_id(user_id, user_id_size);
+  if (remote_action.type == ControlType::service_status) {
+    auto props_it = render->client_properties_.find(remote_id);
+    if (props_it != render->client_properties_.end()) {
+      render->ApplyRemoteServiceStatus(*props_it->second, remote_action.ss);
+    }
+    return;
+  }
+
+  if (remote_action.type == ControlType::service_command) {
+#if _WIN32
+    if (remote_action.c.flag == ServiceCommandFlag::send_sas) {
+      render->pending_windows_service_sas_.store(true,
+                                                 std::memory_order_relaxed);
+    }
+#endif
+    return;
+  }
+
   // std::shared_lock lock(render->client_properties_mutex_);
   if (remote_action.type == ControlType::host_infomation) {
     if (render->client_properties_.find(remote_id) !=
@@ -568,17 +1093,65 @@ void Render::OnReceiveDataBufferCb(const char* data, size_t size,
           remote_action.i.host_name, remote_action.i.host_name_size);
       LOG_INFO("Remote hostname: [{}]",
                render->connection_host_names_[remote_id]);
-
-      for (int i = 0; i < remote_action.i.display_num; i++) {
-        render->display_info_list_.push_back(
-            DisplayInfo(remote_action.i.display_list[i],
-                        remote_action.i.left[i], remote_action.i.top[i],
-                        remote_action.i.right[i], remote_action.i.bottom[i]));
-      }
       FreeRemoteAction(remote_action);
     }
   } else {
     // remote
+#if _WIN32
+    if (render->local_service_status_received_ &&
+        render->local_service_available_ &&
+        IsSecureDesktopInteractionRequired(render->local_interactive_stage_)) {
+      if (remote_action.type == ControlType::mouse) {
+        int absolute_x = 0;
+        int absolute_y = 0;
+        if (!BuildAbsoluteMousePosition(render->display_info_list_,
+                                        render->selected_display_,
+                                        remote_action.m.x, remote_action.m.y,
+                                        &absolute_x, &absolute_y)) {
+          LOG_WARN(
+              "Secure desktop mouse injection skipped, invalid display "
+              "mapping: display_index={}, x={}, y={}",
+              render->selected_display_, remote_action.m.x, remote_action.m.y);
+          return;
+        }
+
+        const std::string response = SendCrossDeskSecureDesktopMouseInput(
+            absolute_x, absolute_y, remote_action.m.s,
+            static_cast<int>(remote_action.m.flag), 1000);
+        auto json = nlohmann::json::parse(response, nullptr, false);
+        if (json.is_discarded() || !json.value("ok", false)) {
+          LogSecureDesktopInputBlocked(
+              &render->last_local_secure_input_block_log_tick_, "local",
+              render->local_interactive_stage_.c_str());
+          LOG_WARN(
+              "Secure desktop mouse injection failed, x={}, y={}, wheel={}, "
+              "flag={}, response={}",
+              absolute_x, absolute_y, remote_action.m.s,
+              static_cast<int>(remote_action.m.flag), response);
+        }
+        return;
+      }
+
+      if (remote_action.type == ControlType::keyboard) {
+        const int key_code = static_cast<int>(remote_action.k.key_value);
+        const bool is_down = remote_action.k.flag == KeyFlag::key_down;
+        const std::string response = SendCrossDeskSecureDesktopKeyInput(
+            key_code, is_down, remote_action.k.scan_code,
+            remote_action.k.extended, 1000);
+        auto json = nlohmann::json::parse(response, nullptr, false);
+        if (json.is_discarded() || !json.value("ok", false)) {
+          LogSecureDesktopInputBlocked(
+              &render->last_local_secure_input_block_log_tick_, "local",
+              render->local_interactive_stage_.c_str());
+          LOG_WARN(
+              "Secure desktop keyboard injection failed, key_code={}, "
+              "is_down={}, response={}",
+              key_code, is_down, response);
+        }
+        return;
+      }
+    }
+#endif
     if (remote_action.type == ControlType::mouse && render->mouse_controller_) {
       render->mouse_controller_->SendMouseCommand(remote_action,
                                                   render->selected_display_);
@@ -591,7 +1164,8 @@ void Render::OnReceiveDataBufferCb(const char* data, size_t size,
                render->keyboard_capturer_) {
       render->keyboard_capturer_->SendKeyboardCommand(
           (int)remote_action.k.key_value,
-          remote_action.k.flag == KeyFlag::key_down);
+          remote_action.k.flag == KeyFlag::key_down, remote_action.k.scan_code,
+          remote_action.k.extended);
     } else if (remote_action.type == ControlType::display_id &&
                render->screen_capturer_) {
       render->selected_display_ = remote_action.d;
@@ -614,6 +1188,7 @@ void Render::OnSignalStatusCb(SignalStatus status, const char* user_id,
       render->signal_connected_ = false;
     } else if (SignalStatus::SignalConnected == status) {
       render->signal_connected_ = true;
+      render->need_to_send_recent_connections_ = true;
       LOG_INFO("[{}] connected to signal server", client_id);
     } else if (SignalStatus::SignalFailed == status) {
       render->signal_connected_ = false;
@@ -671,6 +1246,7 @@ void Render::OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
 
     switch (status) {
       case ConnectionStatus::Connected: {
+        render->ResetRemoteServiceStatus(*props);
         {
           RemoteAction remote_action;
           remote_action.i.display_num = render->display_info_list_.size();
@@ -723,13 +1299,18 @@ void Render::OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
             0, (int)render->title_bar_height_,
             (int)render->stream_window_width_,
             (int)(render->stream_window_height_ - render->title_bar_height_)};
+        props->stream_render_rect_f_ = {
+            0.0f, render->title_bar_height_, render->stream_window_width_,
+            render->stream_window_height_ - render->title_bar_height_};
+        render->start_keyboard_capturer_ = true;
         break;
       }
       case ConnectionStatus::Disconnected:
       case ConnectionStatus::Failed:
       case ConnectionStatus::Closed: {
         props->connection_established_ = false;
-        props->mouse_control_button_pressed_ = false;
+        props->enable_mouse_control_ = false;
+        render->ResetRemoteServiceStatus(*props);
 
         {
           std::lock_guard<std::mutex> lock(props->video_frame_mutex_);
@@ -746,6 +1327,8 @@ void Render::OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
         event.type = render->STREAM_REFRESH_EVENT;
         event.user.data1 = props.get();
         SDL_PushEvent(&event);
+
+        render->focus_on_stream_window_ = false;
 
         break;
       }
@@ -778,6 +1361,9 @@ void Render::OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
 
     switch (status) {
       case ConnectionStatus::Connected: {
+#if _WIN32
+        render->last_windows_service_status_tick_ = 0;
+#endif
         {
           RemoteAction remote_action;
           remote_action.i.display_num = render->display_info_list_.size();
@@ -826,12 +1412,7 @@ void Render::OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
         render->start_screen_capturer_ = true;
         render->start_speaker_capturer_ = true;
         render->remote_client_id_ = remote_id;
-#ifdef CROSSDESK_DEBUG
-        render->start_mouse_controller_ = false;
-        render->start_keyboard_capturer_ = false;
-#else
         render->start_mouse_controller_ = true;
-#endif
         if (std::all_of(render->connection_status_.begin(),
                         render->connection_status_.end(), [](const auto& kv) {
                           return kv.first.find("web") != std::string::npos;
@@ -841,6 +1422,8 @@ void Render::OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
 
         break;
       }
+      case ConnectionStatus::Disconnected:
+      case ConnectionStatus::Failed:
       case ConnectionStatus::Closed: {
         if (std::all_of(render->connection_status_.begin(),
                         render->connection_status_.end(), [](const auto& kv) {
@@ -850,7 +1433,20 @@ void Render::OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
                         })) {
           render->need_to_destroy_server_window_ = true;
           render->is_server_mode_ = false;
+#if defined(__linux__) && !defined(__APPLE__)
+          if (IsWaylandSession()) {
+            // Keep Wayland capture session warm to avoid black screen on
+            // subsequent reconnects.
+            render->start_screen_capturer_ = true;
+            LOG_INFO(
+                "Keeping Wayland screen capturer running after "
+                "disconnect to preserve reconnect stability");
+          } else {
+            render->start_screen_capturer_ = false;
+          }
+#else
           render->start_screen_capturer_ = false;
+#endif
           render->start_speaker_capturer_ = false;
           render->start_mouse_controller_ = false;
           render->start_keyboard_capturer_ = false;
@@ -862,6 +1458,10 @@ void Render::OnConnectionStatusCb(ConnectionStatus status, const char* user_id,
           }
 
           render->connection_status_.erase(remote_id);
+          render->connection_host_names_.erase(remote_id);
+          if (render->screen_capturer_) {
+            render->screen_capturer_->ResetToInitialMonitor();
+          }
         }
 
         if (std::all_of(render->connection_status_.begin(),

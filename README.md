@@ -181,7 +181,7 @@ sudo docker run -d \
   -e MAX_PORT=xxxxx \
   -v /var/lib/crossdesk:/var/lib/crossdesk \
   -v /var/log/crossdesk:/var/log/crossdesk \
-  crossdesk/crossdesk-server:v1.1.3
+  crossdesk/crossdesk-server:v1.1.6
 ```
 
 上述命令中，用户需注意的参数如下：
@@ -208,7 +208,7 @@ sudo docker run -d \
   -e MAX_PORT=60000 \
   -v /var/lib/crossdesk:/var/lib/crossdesk \
   -v /var/log/crossdesk:/var/log/crossdesk \
-  crossdesk/crossdesk-server:v1.1.3
+  crossdesk/crossdesk-server:v1.1.6
 ```
 
 **注意**：
@@ -262,3 +262,8 @@ sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keyc
 
 # 常见问题
 见 [常见问题](https://github.com/kunkundi/crossdesk/blob/self-hosted-server/docs/FAQ.md) 。
+
+# 致谢
+- 感谢 [HelloGitHub](https://hellogithub.com/) 的推荐与关注。
+- 感谢 [阮一峰的科技爱好者周刊](https://github.com/ruanyf/weekly) 的收录与推荐。
+- 感谢 [LinuxDo](https://linux.do) 社区的关注、交流与支持，为 CrossDesk 项目的完善提供了帮助。

@@ -7,6 +7,8 @@
 #include <X11/Xlib.h>
 #endif
 
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -14,7 +16,6 @@
 #include <string>
 #include <thread>
 
-#include "OPPOSans_Regular.h"
 #include "clipboard.h"
 #include "device_controller_factory.h"
 #include "fa_regular_400.h"
@@ -27,6 +28,11 @@
 #include "screen_capturer_factory.h"
 #include "version_checker.h"
 
+#if _WIN32
+#include "interactive_state.h"
+#include "service_host.h"
+#endif
+
 #if defined(__APPLE__)
 #include "window_util_mac.h"
 #endif
@@ -36,6 +42,106 @@
 namespace crossdesk {
 
 namespace {
+const ImWchar* GetMultilingualGlyphRanges() {
+  static std::vector<ImWchar> glyph_ranges;
+  if (glyph_ranges.empty()) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImFontGlyphRangesBuilder builder;
+    builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+    builder.AddRanges(io.Fonts->GetGlyphRangesChineseFull());
+    builder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+
+    ImVector<ImWchar> built_ranges;
+    builder.BuildRanges(&built_ranges);
+    glyph_ranges.assign(built_ranges.Data,
+                        built_ranges.Data + built_ranges.Size);
+  }
+  return glyph_ranges.empty() ? nullptr : glyph_ranges.data();
+}
+
+bool CanReadFontFile(const char* font_path) {
+  if (!font_path) {
+    return false;
+  }
+
+  std::ifstream font_file(font_path, std::ios::binary);
+  return font_file.good();
+}
+
+#if _WIN32
+HICON LoadTrayIcon() {
+  HMODULE module = GetModuleHandleW(nullptr);
+  HICON icon = reinterpret_cast<HICON>(
+      LoadImageW(module, L"IDI_ICON1", IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+  if (icon) {
+    return icon;
+  }
+
+  return LoadIconW(nullptr, IDI_APPLICATION);
+}
+
+struct WindowsServiceInteractiveStatus {
+  bool available = false;
+  unsigned int error_code = 0;
+  std::string interactive_stage;
+  std::string error;
+};
+
+constexpr uint32_t kWindowsServiceStatusIntervalMs = 1000;
+constexpr DWORD kWindowsServiceQueryTimeoutMs = 100;
+constexpr DWORD kWindowsServiceSasTimeoutMs = 500;
+
+RemoteAction BuildWindowsServiceStatusAction(
+    const WindowsServiceInteractiveStatus& status) {
+  RemoteAction action{};
+  action.type = ControlType::service_status;
+  action.ss.available = status.available;
+  std::strncpy(action.ss.interactive_stage, status.interactive_stage.c_str(),
+               sizeof(action.ss.interactive_stage) - 1);
+  action.ss.interactive_stage[sizeof(action.ss.interactive_stage) - 1] = '\0';
+  return action;
+}
+
+bool QueryWindowsServiceInteractiveStatus(
+    WindowsServiceInteractiveStatus* status) {
+  if (status == nullptr) {
+    return false;
+  }
+
+  *status = WindowsServiceInteractiveStatus{};
+  const std::string response =
+      QueryCrossDeskService("status", kWindowsServiceQueryTimeoutMs);
+  auto json = nlohmann::json::parse(response, nullptr, false);
+  if (json.is_discarded() || !json.is_object()) {
+    status->error = "invalid_service_status_json";
+    return false;
+  }
+
+  status->available = json.value("ok", false);
+  if (!status->available) {
+    status->error = json.value("error", std::string("service_unavailable"));
+    status->error_code = json.value("code", 0u);
+    return true;
+  }
+
+  status->interactive_stage = json.value("interactive_stage", std::string());
+
+  if (ShouldNormalizeUnlockToUserDesktop(
+          json.value("interactive_lock_screen_visible", false),
+          status->interactive_stage, json.value("session_locked", false),
+          json.value("interactive_logon_ui_visible", false),
+          json.value("interactive_secure_desktop_active",
+                     json.value("secure_desktop_active", false)),
+          json.value("credential_ui_visible", false),
+          json.value("password_box_visible", false),
+          json.value("unlock_ui_visible", false),
+          json.value("last_session_event", std::string()))) {
+    status->interactive_stage = "user-desktop";
+  }
+  return true;
+}
+#endif
+
 #if defined(__linux__) && !defined(__APPLE__)
 inline bool X11GetDisplayAndWindow(SDL_Window* window, Display** display_out,
                                    ::Window* x11_window_out) {
@@ -334,7 +440,14 @@ SDL_HitTestResult Render::HitTestCallback(SDL_Window* window,
 
 Render::Render() : last_rejoin_check_time_(std::chrono::steady_clock::now()) {}
 
-Render::~Render() {}
+Render::~Render() {
+  if (core_) {
+    cd_core_destroy(core_);
+    core_ = nullptr;
+    config_center_ = nullptr;
+    device_presence_ = nullptr;
+  }
+}
 
 int Render::SaveSettingsIntoCacheFile() {
   cd_cache_mutex_.lock();
@@ -479,7 +592,8 @@ int Render::LoadSettingsFromCacheFile() {
   thumbnail_ = std::make_shared<Thumbnail>(cache_path_ + "/thumbnails/",
                                            aes128_key_, aes128_iv_);
 
-  language_button_value_ = (int)config_center_->GetLanguage();
+  language_button_value_ = localization::detail::ClampLanguageIndex(
+      (int)config_center_->GetLanguage());
   video_quality_button_value_ = (int)config_center_->GetVideoQuality();
   video_frame_rate_button_value_ = (int)config_center_->GetVideoFrameRate();
   video_encode_format_button_value_ =
@@ -553,8 +667,9 @@ int Render::ScreenCapturerInit() {
 
   if (0 == screen_capturer_init_ret) {
     LOG_INFO("Init screen capturer success");
-    if (display_info_list_.empty()) {
-      display_info_list_ = screen_capturer_->GetDisplayInfoList();
+    const auto latest_display_info = screen_capturer_->GetDisplayInfoList();
+    if (!latest_display_info.empty()) {
+      display_info_list_ = latest_display_info;
     }
     return 0;
   } else {
@@ -567,10 +682,22 @@ int Render::ScreenCapturerInit() {
 }
 
 int Render::StartScreenCapturer() {
+  if (!screen_capturer_) {
+    LOG_INFO("Screen capturer instance missing, recreating before start");
+    if (0 != ScreenCapturerInit()) {
+      LOG_ERROR("Recreate screen capturer failed");
+      return -1;
+    }
+  }
+
   if (screen_capturer_) {
     LOG_INFO("Start screen capturer, show cursor: {}", show_cursor_);
 
-    screen_capturer_->Start(show_cursor_);
+    const int ret = screen_capturer_->Start(show_cursor_);
+    if (ret != 0) {
+      LOG_ERROR("Start screen capturer failed: {}", ret);
+      return ret;
+    }
   }
 
   return 0;
@@ -623,14 +750,42 @@ int Render::StartMouseController() {
     LOG_INFO("Device controller factory is nullptr");
     return -1;
   }
+
+#if defined(__linux__) && !defined(__APPLE__)
+  if (IsWaylandSession()) {
+    if (!screen_capturer_) {
+      return 1;
+    }
+
+    const auto latest_display_info = screen_capturer_->GetDisplayInfoList();
+    if (latest_display_info.empty() ||
+        latest_display_info[0].handle == nullptr) {
+      return 1;
+    }
+  }
+
+  if (screen_capturer_) {
+    const auto latest_display_info = screen_capturer_->GetDisplayInfoList();
+    if (!latest_display_info.empty()) {
+      display_info_list_ = latest_display_info;
+    }
+  }
+#endif
+
   mouse_controller_ = (MouseController*)device_controller_factory_->Create(
       DeviceControllerFactory::Device::Mouse);
+  if (!mouse_controller_) {
+    LOG_ERROR("Create mouse controller failed");
+    return -1;
+  }
 
   int mouse_controller_init_ret = mouse_controller_->Init(display_info_list_);
   if (0 != mouse_controller_init_ret) {
     LOG_INFO("Destroy mouse controller");
     mouse_controller_->Destroy();
+    delete mouse_controller_;
     mouse_controller_ = nullptr;
+    return mouse_controller_init_ret;
   }
 
   return 0;
@@ -646,29 +801,51 @@ int Render::StopMouseController() {
 }
 
 int Render::StartKeyboardCapturer() {
+  keyboard_capturer_uses_sdl_events_ = false;
+
+#if defined(__linux__) && !defined(__APPLE__)
+  if (IsWaylandSession()) {
+    keyboard_capturer_uses_sdl_events_ = true;
+    LOG_INFO("Start keyboard capturer with SDL Wayland backend");
+    return 0;
+  }
+#endif
+
   if (!keyboard_capturer_) {
-    LOG_INFO("keyboard capturer is nullptr");
-    return -1;
+    keyboard_capturer_uses_sdl_events_ = true;
+    LOG_WARN(
+        "keyboard capturer is nullptr, falling back to SDL keyboard events");
+    return 0;
   }
 
   int keyboard_capturer_init_ret = keyboard_capturer_->Hook(
-      [](int key_code, bool is_down, void* user_ptr) {
+      [](int key_code, bool is_down, uint32_t scan_code, bool extended,
+         void* user_ptr) {
         if (user_ptr) {
           Render* render = (Render*)user_ptr;
-          render->SendKeyCommand(key_code, is_down);
+          render->SendKeyCommand(key_code, is_down, scan_code, extended);
         }
       },
       this);
   if (0 != keyboard_capturer_init_ret) {
-    LOG_ERROR("Start keyboard capturer failed");
+    keyboard_capturer_uses_sdl_events_ = true;
+    LOG_WARN(
+        "Start keyboard capturer failed, falling back to SDL keyboard "
+        "events");
   } else {
-    LOG_INFO("Start keyboard capturer");
+    LOG_INFO("Start keyboard capturer with native hook");
   }
 
   return 0;
 }
 
 int Render::StopKeyboardCapturer() {
+  if (keyboard_capturer_uses_sdl_events_) {
+    keyboard_capturer_uses_sdl_events_ = false;
+    LOG_INFO("Stop keyboard capturer with SDL keyboard backend");
+    return 0;
+  }
+
   if (keyboard_capturer_) {
     keyboard_capturer_->Unhook();
     LOG_INFO("Stop keyboard capturer");
@@ -810,6 +987,7 @@ int Render::CreateConnectionPeer() {
   params_.on_receive_video_frame = OnReceiveVideoBufferCb;
 
   params_.on_signal_status = OnSignalStatusCb;
+  params_.on_signal_message = OnSignalMessageCb;
   params_.on_connection_status = OnConnectionStatusCb;
   params_.on_net_status_report = OnNetStatusReport;
 
@@ -831,6 +1009,8 @@ int Render::CreateConnectionPeer() {
 
     AddAudioStream(peer_, audio_label_.c_str());
     AddDataStream(peer_, data_label_.c_str(), false);
+    AddDataStream(peer_, mouse_label_.c_str(), false);
+    AddDataStream(peer_, keyboard_label_.c_str(), true);
     AddDataStream(peer_, control_data_label_.c_str(), true);
     AddDataStream(peer_, file_label_.c_str(), true);
     AddDataStream(peer_, file_feedback_label_.c_str(), true);
@@ -847,11 +1027,38 @@ int Render::AudioDeviceInit() {
   desired_out.format = SDL_AUDIO_S16;
   desired_out.channels = 1;
 
-  output_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-                                             &desired_out, nullptr, nullptr);
-  if (!output_stream_) {
+  auto open_stream = [&]() -> bool {
+    output_stream_ = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_out, nullptr, nullptr);
+    return output_stream_ != nullptr;
+  };
+
+  if (!open_stream()) {
+#if defined(__linux__) && !defined(__APPLE__)
+    LOG_WARN(
+        "Failed to open output stream with driver [{}]: {}",
+        getenv("SDL_AUDIODRIVER") ? getenv("SDL_AUDIODRIVER") : "(default)",
+        SDL_GetError());
+
+    setenv("SDL_AUDIODRIVER", "dummy", 1);
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+      LOG_ERROR("Failed to reinitialize SDL audio with dummy driver: {}",
+                SDL_GetError());
+      return -1;
+    }
+
+    if (!open_stream()) {
+      LOG_ERROR("Failed to open output stream with dummy driver: {}",
+                SDL_GetError());
+      return -1;
+    }
+
+    LOG_WARN("Audio output disabled, using SDL dummy audio driver");
+#else
     LOG_ERROR("Failed to open output stream: {}", SDL_GetError());
     return -1;
+#endif
   }
 
   SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(output_stream_));
@@ -869,9 +1076,25 @@ int Render::AudioDeviceDestroy() {
 }
 
 void Render::UpdateInteractions() {
+#if defined(__linux__) && !defined(__APPLE__)
+  const bool is_wayland_session = IsWaylandSession();
+  const bool stop_wayland_mouse_before_screen =
+      is_wayland_session && !start_screen_capturer_ &&
+      screen_capturer_is_started_ && !start_mouse_controller_ &&
+      mouse_controller_is_started_;
+  if (stop_wayland_mouse_before_screen) {
+    LOG_INFO(
+        "Stopping Wayland mouse controller before screen capturer to "
+        "cleanly release the shared portal session");
+    StopMouseController();
+    mouse_controller_is_started_ = false;
+  }
+#endif
+
   if (start_screen_capturer_ && !screen_capturer_is_started_) {
-    StartScreenCapturer();
-    screen_capturer_is_started_ = true;
+    if (0 == StartScreenCapturer()) {
+      screen_capturer_is_started_ = true;
+    }
   } else if (!start_screen_capturer_ && screen_capturer_is_started_) {
     StopScreenCapturer();
     screen_capturer_is_started_ = false;
@@ -886,17 +1109,29 @@ void Render::UpdateInteractions() {
   }
 
   if (start_mouse_controller_ && !mouse_controller_is_started_) {
-    StartMouseController();
-    mouse_controller_is_started_ = true;
+    if (0 == StartMouseController()) {
+      mouse_controller_is_started_ = true;
+    }
   } else if (!start_mouse_controller_ && mouse_controller_is_started_) {
     StopMouseController();
     mouse_controller_is_started_ = false;
   }
 
+#if defined(__linux__) && !defined(__APPLE__)
+  if (screen_capturer_is_started_ && screen_capturer_ && mouse_controller_) {
+    const auto latest_display_info = screen_capturer_->GetDisplayInfoList();
+    if (!latest_display_info.empty()) {
+      display_info_list_ = latest_display_info;
+      mouse_controller_->UpdateDisplayInfoList(display_info_list_);
+    }
+  }
+#endif
+
   if (start_keyboard_capturer_ && focus_on_stream_window_) {
     if (!keyboard_capturer_is_started_) {
-      StartKeyboardCapturer();
-      keyboard_capturer_is_started_ = true;
+      if (StartKeyboardCapturer() == 0) {
+        keyboard_capturer_is_started_ = true;
+      }
     }
   } else if (keyboard_capturer_is_started_) {
     StopKeyboardCapturer();
@@ -937,6 +1172,7 @@ int Render::CreateMainWindow() {
         (int)(server_window_width_default_ * dpi_scale_);
     server_window_normal_height_ =
         (int)(server_window_height_default_ * dpi_scale_);
+    window_rounding_ = window_rounding_default_ * dpi_scale_;
 
     SDL_SetWindowSize(main_window_, (int)main_window_width_,
                       (int)main_window_height_);
@@ -960,8 +1196,7 @@ int Render::CreateMainWindow() {
   HWND main_hwnd = (HWND)SDL_GetPointerProperty(
       props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
 
-  HICON tray_icon = (HICON)LoadImageW(NULL, L"crossdesk.ico", IMAGE_ICON, 0, 0,
-                                      LR_LOADFROMFILE | LR_DEFAULTSIZE);
+  HICON tray_icon = LoadTrayIcon();
   tray_ = std::make_unique<WinTray>(main_hwnd, tray_icon, L"CrossDesk",
                                     localization_language_index_);
 #endif
@@ -1058,13 +1293,18 @@ int Render::DestroyStreamWindow() {
 
   if (stream_renderer_) {
     SDL_DestroyRenderer(stream_renderer_);
+    stream_renderer_ = nullptr;
   }
 
   if (stream_window_) {
     SDL_DestroyWindow(stream_window_);
+    stream_window_ = nullptr;
   }
 
   stream_window_created_ = false;
+  focus_on_stream_window_ = false;
+  stream_window_grabbed_ = false;
+  control_mouse_ = false;
 
   return 0;
 }
@@ -1166,13 +1406,16 @@ int Render::DestroyServerWindow() {
 
   if (server_renderer_) {
     SDL_DestroyRenderer(server_renderer_);
+    server_renderer_ = nullptr;
   }
 
   if (server_window_) {
     SDL_DestroyWindow(server_window_);
+    server_window_ = nullptr;
   }
 
   server_window_created_ = false;
+  server_window_inited_ = false;
 
   return 0;
 }
@@ -1185,78 +1428,68 @@ int Render::SetupFontAndStyle(ImFont** system_chinese_font_out) {
 
   io.IniFilename = NULL;  // disable imgui.ini
 
-  // Load Fonts
+  // Build one merged atlas: UI font + icon font + multilingual fallback fonts.
   ImFontConfig config;
   config.FontDataOwnedByAtlas = false;
-  io.Fonts->AddFontFromMemoryTTF(OPPOSans_Regular_ttf, OPPOSans_Regular_ttf_len,
-                                 font_size, &config,
-                                 io.Fonts->GetGlyphRangesChineseFull());
-  config.MergeMode = true;
-  static const ImWchar icon_ranges[] = {ICON_MIN_FA, ICON_MAX_FA, 0};
-  io.Fonts->AddFontFromMemoryTTF(fa_solid_900_ttf, fa_solid_900_ttf_len, 30.0f,
-                                 &config, icon_ranges);
-
-  // Load system Chinese font as fallback
   config.MergeMode = false;
-  config.FontDataOwnedByAtlas = false;
+
   if (system_chinese_font_out) {
     *system_chinese_font_out = nullptr;
   }
 
+  ImFont* ui_font = nullptr;
+  const ImWchar* multilingual_ranges = GetMultilingualGlyphRanges();
+
 #if defined(_WIN32)
-  // Windows: Try Microsoft YaHei (微软雅黑) first, then SimSun (宋体)
-  const char* font_paths[] = {"C:/Windows/Fonts/msyh.ttc",
-                              "C:/Windows/Fonts/msyhbd.ttc",
-                              "C:/Windows/Fonts/simsun.ttc", nullptr};
+  const char* base_font_paths[] = {
+      "C:/Windows/Fonts/msyh.ttc",    "C:/Windows/Fonts/msyhbd.ttc",
+      "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf",
+      "C:/Windows/Fonts/simsun.ttc",  nullptr};
 #elif defined(__APPLE__)
-  // macOS: Try PingFang SC first, then STHeiti
-  const char* font_paths[] = {"/System/Library/Fonts/PingFang.ttc",
-                              "/System/Library/Fonts/STHeiti Light.ttc",
-                              "/System/Library/Fonts/STHeiti Medium.ttc",
-                              nullptr};
+  const char* base_font_paths[] = {
+      "/System/Library/Fonts/PingFang.ttc",
+      "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+      "/System/Library/Fonts/Supplemental/Arial.ttf",
+      "/System/Library/Fonts/SFNS.ttf", nullptr};
 #else
-  // Linux: Try common Chinese fonts
-  const char* font_paths[] = {
+  const char* base_font_paths[] = {
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+      "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
       "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
       "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-      "/usr/share/fonts/truetype/arphic/uming.ttc",
-      "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", nullptr};
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+      nullptr};
 #endif
 
-  for (int i = 0; font_paths[i] != nullptr; i++) {
-    std::ifstream font_file(font_paths[i], std::ios::binary);
-    if (font_file.good()) {
-      font_file.close();
-      if (!system_chinese_font_out) {
-        break;
-      }
-
-      *system_chinese_font_out =
-          io.Fonts->AddFontFromFileTTF(font_paths[i], font_size, &config,
-                                       io.Fonts->GetGlyphRangesChineseFull());
-      if (*system_chinese_font_out != nullptr) {
-        // Merge FontAwesome icons into the Chinese font
-        config.MergeMode = true;
-        static const ImWchar icon_ranges[] = {ICON_MIN_FA, ICON_MAX_FA, 0};
-        io.Fonts->AddFontFromMemoryTTF(fa_solid_900_ttf, fa_solid_900_ttf_len,
-                                       font_size, &config, icon_ranges);
-        config.MergeMode = false;
-        LOG_INFO("Loaded system Chinese font with icons: {}", font_paths[i]);
-        break;
-      }
+  for (int i = 0; base_font_paths[i] != nullptr && ui_font == nullptr; ++i) {
+    if (!CanReadFontFile(base_font_paths[i])) {
+      continue;
+    }
+    ui_font = io.Fonts->AddFontFromFileTTF(base_font_paths[i], font_size,
+                                           &config, multilingual_ranges);
+    if (ui_font != nullptr) {
+      LOG_INFO("Loaded base UI font: {}", base_font_paths[i]);
     }
   }
+  if (!ui_font) {
+    ui_font = io.Fonts->AddFontDefault(&config);
+  }
 
-  // If no system font found, use default font
-  if (system_chinese_font_out && *system_chinese_font_out == nullptr) {
-    *system_chinese_font_out = io.Fonts->AddFontDefault(&config);
-    // Merge FontAwesome icons into the default font
-    config.MergeMode = true;
-    static const ImWchar icon_ranges[] = {ICON_MIN_FA, ICON_MAX_FA, 0};
-    io.Fonts->AddFontFromMemoryTTF(fa_solid_900_ttf, fa_solid_900_ttf_len,
-                                   font_size, &config, icon_ranges);
-    config.MergeMode = false;
-    LOG_WARN("System Chinese font not found, using default font with icons");
+  if (!ui_font) {
+    LOG_WARN("Failed to initialize base UI font");
+    ImGui::StyleColorsLight();
+    return 0;
+  }
+
+  ImFontConfig icon_config = config;
+  icon_config.MergeMode = true;
+  static const ImWchar icon_ranges[] = {ICON_MIN_FA, ICON_MAX_FA, 0};
+  io.Fonts->AddFontFromMemoryTTF(fa_solid_900_ttf, fa_solid_900_ttf_len,
+                                 font_size, &icon_config, icon_ranges);
+
+  io.FontDefault = ui_font;
+  if (system_chinese_font_out) {
+    *system_chinese_font_out = ui_font;
   }
 
   ImGui::StyleColorsLight();
@@ -1296,7 +1529,7 @@ int Render::DrawMainWindow() {
 
   ImGuiIO& io = ImGui::GetIO();
   ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, window_rounding_);
 
   ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
   ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, io.DisplaySize.y),
@@ -1385,10 +1618,8 @@ int Render::DrawStreamWindow() {
     auto props = it.second;
     if (props->tab_selected_) {
       SDL_FRect render_rect_f = {
-          static_cast<float>(props->stream_render_rect_.x),
-          static_cast<float>(props->stream_render_rect_.y),
-          static_cast<float>(props->stream_render_rect_.w),
-          static_cast<float>(props->stream_render_rect_.h)};
+          props->stream_render_rect_f_.x, props->stream_render_rect_f_.y,
+          props->stream_render_rect_f_.w, props->stream_render_rect_f_.h};
       SDL_RenderTexture(stream_renderer_, props->stream_texture_, NULL,
                         &render_rect_f);
     }
@@ -1429,10 +1660,10 @@ int Render::Run() {
   if (!latest_version_info_.empty() &&
       latest_version_info_.contains("version") &&
       latest_version_info_["version"].is_string()) {
-    latest_version_ = latest_version_info_["version"];
+    latest_version_ = 'v' + latest_version_info_["version"].get<std::string>();
     if (latest_version_info_.contains("releaseNotes") &&
         latest_version_info_["releaseNotes"].is_string()) {
-      release_notes_ = latest_version_info_["releaseNotes"];
+      release_notes_ = latest_version_info_["releaseNotes"].get<std::string>();
     } else {
       release_notes_ = "";
     }
@@ -1450,8 +1681,13 @@ int Render::Run() {
     exec_log_path_ = path_manager_->GetLogPath().string();
     dll_log_path_ = path_manager_->GetLogPath().string();
     cache_path_ = path_manager_->GetCachePath().string();
-    config_center_ =
-        std::make_unique<ConfigCenter>(cache_path_ + "/config.ini");
+    core_ = cd_core_create(cache_path_.c_str());
+    if (!core_) {
+      std::cerr << "Failed to create crossdesk_core" << std::endl;
+      return -1;
+    }
+    config_center_ = cd_internal_get_config_center(core_);
+    device_presence_ = cd_internal_get_device_presence(core_);
     strncpy(signal_server_ip_self_,
             config_center_->GetSignalServerHost().c_str(),
             sizeof(signal_server_ip_self_) - 1);
@@ -1493,16 +1729,27 @@ void Render::InitializeLogger() { InitLogger(exec_log_path_); }
 void Render::InitializeSettings() {
   LoadSettingsFromCacheFile();
 
-  localization_language_ = (ConfigCenter::LANGUAGE)language_button_value_;
-  localization_language_index_ = language_button_value_;
-  if (localization_language_index_ != 0 && localization_language_index_ != 1) {
-    localization_language_index_ = 0;
-    LOG_ERROR("Invalid language index: [{}], use [0] by default",
-              localization_language_index_);
+  localization_language_index_ =
+      localization::detail::ClampLanguageIndex(language_button_value_);
+  language_button_value_ = localization_language_index_;
+
+  if (localization_language_index_ == 0) {
+    localization_language_ = ConfigCenter::LANGUAGE::CHINESE;
+  } else if (localization_language_index_ == 1) {
+    localization_language_ = ConfigCenter::LANGUAGE::ENGLISH;
+  } else {
+    localization_language_ = ConfigCenter::LANGUAGE::RUSSIAN;
   }
 }
 
 void Render::InitializeSDL() {
+#if defined(__linux__) && !defined(__APPLE__)
+  if (!getenv("SDL_AUDIODRIVER")) {
+    // Prefer PulseAudio first on Linux to avoid hard ALSA plugin dependency.
+    setenv("SDL_AUDIODRIVER", "pulseaudio", 0);
+  }
+#endif
+
   if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
     LOG_ERROR("Error: {}", SDL_GetError());
     return;
@@ -1539,7 +1786,8 @@ void Render::InitializeModules() {
           std::shared_lock lock(client_properties_mutex_);
           int ret = -1;
           for (const auto& [remote_id, props] : client_properties_) {
-            if (props && props->peer_ && props->connection_established_) {
+            if (props && props->peer_ && props->connection_established_ &&
+                props->enable_mouse_control_) {
               ret = SendReliableDataFrame(props->peer_, data, size,
                                           props->clipboard_label_.c_str());
               if (ret != 0) {
@@ -1593,8 +1841,11 @@ void Render::MainLoop() {
 
     UpdateLabels();
     HandleRecentConnections();
+    HandleConnectionStatusChange();
+    HandlePendingPresenceProbe();
     HandleStreamWindow();
     HandleServerWindow();
+    HandleWindowsServiceIntegration();
 
     DrawMainWindow();
     if (stream_window_inited_) {
@@ -1621,6 +1872,141 @@ void Render::UpdateLabels() {
   }
 }
 
+void Render::ResetRemoteServiceStatus(SubStreamWindowProperties& props) {
+  props.remote_service_status_received_ = false;
+  props.remote_service_available_ = false;
+  props.remote_interactive_stage_.clear();
+}
+
+void Render::ApplyRemoteServiceStatus(SubStreamWindowProperties& props,
+                                      const ServiceStatus& status) {
+  props.remote_service_status_received_ = true;
+  props.remote_service_available_ = status.available;
+  props.remote_interactive_stage_ = status.interactive_stage;
+}
+
+Render::RemoteUnlockState Render::GetRemoteUnlockState(
+    const SubStreamWindowProperties& props) const {
+  if (!props.remote_service_status_received_) {
+    return RemoteUnlockState::none;
+  }
+  if (!props.remote_service_available_) {
+    return RemoteUnlockState::service_unavailable;
+  }
+  if (props.remote_interactive_stage_ == "credential-ui") {
+    return RemoteUnlockState::credential_ui;
+  }
+  if (props.remote_interactive_stage_ == "lock-screen") {
+    return RemoteUnlockState::lock_screen;
+  }
+  if (props.remote_interactive_stage_ == "secure-desktop") {
+    return RemoteUnlockState::secure_desktop;
+  }
+  return RemoteUnlockState::none;
+}
+
+void Render::HandleWindowsServiceIntegration() {
+#if _WIN32
+  static bool last_logged_service_available = true;
+  static unsigned int last_logged_service_error_code = 0;
+  static std::string last_logged_service_error;
+
+  if (!is_server_mode_ || peer_ == nullptr) {
+    ResetLocalWindowsServiceState(true);
+    return;
+  }
+
+  const bool has_connected_remote =
+      std::any_of(connection_status_.begin(), connection_status_.end(),
+                  [](const auto& entry) {
+                    return entry.second == ConnectionStatus::Connected;
+                  });
+  if (!has_connected_remote) {
+    ResetLocalWindowsServiceState(false);
+    return;
+  }
+
+  bool force_broadcast = false;
+  if (pending_windows_service_sas_.exchange(false, std::memory_order_relaxed)) {
+    const std::string response =
+        QueryCrossDeskService("sas", kWindowsServiceSasTimeoutMs);
+    auto json = nlohmann::json::parse(response, nullptr, false);
+    if (json.is_discarded() || !json.value("ok", false)) {
+      LOG_WARN("Remote SAS request failed: {}", response);
+    } else {
+      LOG_INFO("Remote SAS request forwarded to local Windows service");
+    }
+    last_windows_service_status_tick_ = 0;
+    force_broadcast = true;
+  }
+
+  const uint32_t now = static_cast<uint32_t>(SDL_GetTicks());
+  if (!force_broadcast && last_windows_service_status_tick_ != 0 &&
+      now - last_windows_service_status_tick_ <
+          kWindowsServiceStatusIntervalMs) {
+    return;
+  }
+  last_windows_service_status_tick_ = now;
+
+  WindowsServiceInteractiveStatus status;
+  const bool status_ok = QueryWindowsServiceInteractiveStatus(&status);
+  local_service_status_received_ = status_ok;
+  local_service_available_ = status.available;
+  local_interactive_stage_ = status.available ? status.interactive_stage : "";
+
+  if (status_ok) {
+    const bool availability_changed =
+        status.available != last_logged_service_available;
+    const bool error_changed =
+        !status.available &&
+        (status.error != last_logged_service_error ||
+         status.error_code != last_logged_service_error_code);
+    if (availability_changed || error_changed) {
+      if (status.available) {
+        LOG_INFO(
+            "Local Windows service available for secure desktop integration");
+      } else {
+        LOG_WARN(
+            "Local Windows service unavailable, secure desktop integration "
+            "disabled: error={}, code={}",
+            status.error, status.error_code);
+      }
+      last_logged_service_available = status.available;
+      last_logged_service_error = status.error;
+      last_logged_service_error_code = status.error_code;
+    }
+  } else if (last_logged_service_available ||
+             last_logged_service_error != "invalid_service_status_json") {
+    LOG_WARN(
+        "Local Windows service status query failed, secure desktop integration "
+        "disabled");
+    last_logged_service_available = false;
+    last_logged_service_error = "invalid_service_status_json";
+    last_logged_service_error_code = 0;
+  }
+
+  RemoteAction remote_action = BuildWindowsServiceStatusAction(status);
+  std::string msg = remote_action.to_json();
+  int ret = SendReliableDataFrame(peer_, msg.data(), msg.size(),
+                                  control_data_label_.c_str());
+  if (ret != 0) {
+    LOG_WARN("Broadcast Windows service status failed, ret={}", ret);
+  }
+#endif
+}
+
+#if _WIN32
+void Render::ResetLocalWindowsServiceState(bool clear_pending_sas) {
+  last_windows_service_status_tick_ = 0;
+  if (clear_pending_sas) {
+    pending_windows_service_sas_.store(false, std::memory_order_relaxed);
+  }
+  local_service_status_received_ = false;
+  local_service_available_ = false;
+  local_interactive_stage_.clear();
+}
+#endif
+
 void Render::HandleRecentConnections() {
   if (reload_recent_connections_ && main_renderer_) {
     uint32_t now_time = SDL_GetTicks();
@@ -1632,8 +2018,122 @@ void Render::HandleRecentConnections() {
         LOG_INFO("Load recent connection thumbnails");
       }
       reload_recent_connections_ = false;
+
+      recent_connection_ids_.clear();
+      for (const auto& conn : recent_connections_) {
+        recent_connection_ids_.push_back(conn.first);
+      }
+      need_to_send_recent_connections_ = true;
     }
   }
+}
+
+void Render::HandleConnectionStatusChange() {
+  if (signal_connected_ && peer_ && need_to_send_recent_connections_) {
+    if (!recent_connection_ids_.empty()) {
+      nlohmann::json j;
+      j["type"] = "recent_connections_presence";
+      j["user_id"] = client_id_;
+      j["devices"] = nlohmann::json::array();
+      for (const auto& id : recent_connection_ids_) {
+        std::string pure_id = id;
+        size_t pos_y = pure_id.find('Y');
+        size_t pos_n = pure_id.find('N');
+        size_t pos = std::string::npos;
+        if (pos_y != std::string::npos &&
+            (pos_n == std::string::npos || pos_y < pos_n)) {
+          pos = pos_y;
+        } else if (pos_n != std::string::npos) {
+          pos = pos_n;
+        }
+        if (pos != std::string::npos) {
+          pure_id = pure_id.substr(0, pos);
+        }
+        j["devices"].push_back(pure_id);
+      }
+      auto s = j.dump();
+      SendSignalMessage(peer_, s.data(), s.size());
+    }
+  }
+  need_to_send_recent_connections_ = false;
+}
+
+void Render::HandlePendingPresenceProbe() {
+  bool has_action = false;
+  bool should_connect = false;
+  bool remember_password = false;
+  std::string remote_id;
+  std::string password;
+
+  {
+    std::lock_guard<std::mutex> lock(pending_presence_probe_mutex_);
+    if (!pending_presence_probe_ || !pending_presence_result_ready_) {
+      return;
+    }
+
+    has_action = true;
+    should_connect = pending_presence_online_;
+    remote_id = pending_presence_remote_id_;
+    password = pending_presence_password_;
+    remember_password = pending_presence_remember_password_;
+
+    pending_presence_probe_ = false;
+    pending_presence_result_ready_ = false;
+    pending_presence_online_ = false;
+    pending_presence_remote_id_.clear();
+    pending_presence_password_.clear();
+    pending_presence_remember_password_ = false;
+  }
+
+  if (!has_action) {
+    return;
+  }
+
+  if (should_connect) {
+    ConnectTo(remote_id, password.c_str(), remember_password, true);
+    return;
+  }
+
+  offline_warning_text_ =
+      localization::device_offline[localization_language_index_];
+  show_offline_warning_window_ = true;
+}
+
+int Render::RequestSingleDevicePresence(const std::string& remote_id,
+                                        const char* password,
+                                        bool remember_password) {
+  if (!signal_connected_ || !peer_) {
+    return -1;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(pending_presence_probe_mutex_);
+    pending_presence_probe_ = true;
+    pending_presence_result_ready_ = false;
+    pending_presence_online_ = false;
+    pending_presence_remote_id_ = remote_id;
+    pending_presence_password_ = password ? password : "";
+    pending_presence_remember_password_ = remember_password;
+  }
+
+  nlohmann::json j;
+  j["type"] = "recent_connections_presence";
+  j["user_id"] = client_id_;
+  j["devices"] = nlohmann::json::array({remote_id});
+  auto s = j.dump();
+
+  int ret = SendSignalMessage(peer_, s.data(), s.size());
+  if (ret != 0) {
+    std::lock_guard<std::mutex> lock(pending_presence_probe_mutex_);
+    pending_presence_probe_ = false;
+    pending_presence_result_ready_ = false;
+    pending_presence_online_ = false;
+    pending_presence_remote_id_.clear();
+    pending_presence_password_.clear();
+    pending_presence_remember_password_ = false;
+  }
+
+  return ret;
 }
 
 void Render::HandleStreamWindow() {
@@ -1668,6 +2168,12 @@ void Render::HandleServerWindow() {
 void Render::Cleanup() {
   Clipboard::StopMonitoring();
 
+  if (mouse_controller_) {
+    mouse_controller_->Destroy();
+    delete mouse_controller_;
+    mouse_controller_ = nullptr;
+  }
+
   if (screen_capturer_) {
     screen_capturer_->Destroy();
     delete screen_capturer_;
@@ -1678,12 +2184,6 @@ void Render::Cleanup() {
     speaker_capturer_->Destroy();
     delete speaker_capturer_;
     speaker_capturer_ = nullptr;
-  }
-
-  if (mouse_controller_) {
-    mouse_controller_->Destroy();
-    delete mouse_controller_;
-    mouse_controller_ = nullptr;
   }
 
   if (keyboard_capturer_) {
@@ -1767,9 +2267,9 @@ void Render::CleanupPeers() {
     LOG_INFO("[{}] Leave connection [{}]", client_id_, client_id_);
     LeaveConnection(peer_, client_id_);
     is_client_mode_ = false;
+    StopMouseController();
     StopScreenCapturer();
     StopSpeakerCapturer();
-    StopMouseController();
     StopKeyboardCapturer();
     LOG_INFO("Destroy peer [{}]", client_id_);
     DestroyPeer(&peer_);
@@ -2047,26 +2547,37 @@ void Render::UpdateRenderRect() {
     float render_area_height = props->render_window_height_;
 
     props->stream_render_rect_last_ = props->stream_render_rect_;
+
+    SDL_FRect rect_f{props->render_window_x_, props->render_window_y_,
+                     render_area_width, render_area_height};
     if (render_area_width < render_area_height * video_ratio) {
-      props->stream_render_rect_ = {
-          (int)props->render_window_x_,
-          (int)(abs(render_area_height -
-                    render_area_width * video_ratio_reverse) /
-                    2 +
-                (int)props->render_window_y_),
-          (int)render_area_width,
-          (int)(render_area_width * video_ratio_reverse)};
+      rect_f.x = props->render_window_x_;
+      rect_f.y = std::abs(render_area_height -
+                          render_area_width * video_ratio_reverse) /
+                     2.0f +
+                 props->render_window_y_;
+      rect_f.w = render_area_width;
+      rect_f.h = render_area_width * video_ratio_reverse;
     } else if (render_area_width > render_area_height * video_ratio) {
-      props->stream_render_rect_ = {
-          (int)abs(render_area_width - render_area_height * video_ratio) / 2 +
-              (int)props->render_window_x_,
-          (int)props->render_window_y_, (int)(render_area_height * video_ratio),
-          (int)render_area_height};
+      rect_f.x =
+          std::abs(render_area_width - render_area_height * video_ratio) /
+              2.0f +
+          props->render_window_x_;
+      rect_f.y = props->render_window_y_;
+      rect_f.w = render_area_height * video_ratio;
+      rect_f.h = render_area_height;
     } else {
-      props->stream_render_rect_ = {
-          (int)props->render_window_x_, (int)props->render_window_y_,
-          (int)render_area_width, (int)render_area_height};
+      rect_f.x = props->render_window_x_;
+      rect_f.y = props->render_window_y_;
+      rect_f.w = render_area_width;
+      rect_f.h = render_area_height;
     }
+
+    props->stream_render_rect_f_ = rect_f;
+    props->stream_render_rect_ = {static_cast<int>(std::lround(rect_f.x)),
+                                  static_cast<int>(std::lround(rect_f.y)),
+                                  static_cast<int>(std::lround(rect_f.w)),
+                                  static_cast<int>(std::lround(rect_f.h))};
   }
 }
 
@@ -2194,6 +2705,7 @@ void Render::ProcessSdlEvent(const SDL_Event& event) {
     case SDL_EVENT_WINDOW_FOCUS_LOST:
       if (stream_window_ &&
           SDL_GetWindowID(stream_window_) == event.window.windowID) {
+        ForceReleasePressedKeys();
         focus_on_stream_window_ = false;
       } else if (main_window_ &&
                  SDL_GetWindowID(main_window_) == event.window.windowID) {
@@ -2207,9 +2719,30 @@ void Render::ProcessSdlEvent(const SDL_Event& event) {
     case SDL_EVENT_MOUSE_MOTION:
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:
-    case SDL_EVENT_MOUSE_WHEEL:
-      if (focus_on_stream_window_) {
+    case SDL_EVENT_MOUSE_WHEEL: {
+      Uint32 mouse_window_id = 0;
+      if (event.type == SDL_EVENT_MOUSE_MOTION) {
+        mouse_window_id = event.motion.windowID;
+      } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                 event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        mouse_window_id = event.button.windowID;
+      } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+        mouse_window_id = event.wheel.windowID;
+      }
+
+      if (focus_on_stream_window_ && stream_window_ &&
+          SDL_GetWindowID(stream_window_) == mouse_window_id) {
         ProcessMouseEvent(event);
+      }
+      break;
+    }
+
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP:
+      if (keyboard_capturer_is_started_ && keyboard_capturer_uses_sdl_events_ &&
+          focus_on_stream_window_ && stream_window_ &&
+          SDL_GetWindowID(stream_window_) == event.key.windowID) {
+        ProcessKeyboardEvent(event);
       }
       break;
 
